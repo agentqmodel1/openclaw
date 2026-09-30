@@ -1,4 +1,4 @@
-import { normalizeLowercaseStringOrEmpty } from "openclaw/plugin-sdk/text-runtime";
+import { normalizeLowercaseStringOrEmpty } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { readQaScenarioExecutionConfig } from "./scenario-catalog.js";
 
 function readRequiredDiscoveryRefs() {
@@ -7,7 +7,7 @@ function readRequiredDiscoveryRefs() {
     | undefined;
   return (
     config?.requiredFiles ?? [
-      "repo/qa/scenarios/index.md",
+      "repo/qa/scenarios/index.yaml",
       "repo/extensions/qa-lab/src/suite.ts",
       "repo/docs/help/testing.md",
     ]
@@ -31,16 +31,7 @@ function confirmsDiscoveryFileRead(text: string) {
   const lower = normalizeLowercaseStringOrEmpty(text);
   const mentionsAllRefs = REQUIRED_DISCOVERY_REFS_LOWER.every((ref) => lower.includes(ref));
   const mentionsReadVerb = /(?:read|retrieved|inspected|loaded|accessed|digested)/.test(lower);
-  const requiredCountPattern = "(?:three|3|four|4)";
-  const confirmsRead =
-    new RegExp(
-      `(?:read|retrieved|inspected|loaded|accessed|digested)\\s+all\\s+${requiredCountPattern}\\s+(?:(?:requested|required|mandated|seeded)\\s+)?files`,
-    ).test(lower) ||
-    new RegExp(
-      `all\\s+${requiredCountPattern}\\s+(?:(?:requested|required|mandated|seeded)\\s+)?files\\s+(?:were\\s+)?(?:read|retrieved|inspected|loaded|accessed|digested)(?:\\s+\\w+)?`,
-    ).test(lower) ||
-    new RegExp(`all\\s+${requiredCountPattern}\\s+seeded files readable`).test(lower);
-  return mentionsAllRefs && (confirmsRead || mentionsReadVerb);
+  return mentionsAllRefs && mentionsReadVerb;
 }
 
 export function hasDiscoveryLabels(text: string) {

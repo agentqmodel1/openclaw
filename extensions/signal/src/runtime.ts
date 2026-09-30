@@ -3,10 +3,10 @@ import { createPluginRuntimeStore } from "openclaw/plugin-sdk/runtime-store";
 
 const {
   setRuntime: setSignalRuntime,
-  clearRuntime: clearSignalRuntime,
   getRuntime: getSignalRuntime,
+  tryGetRuntime: getOptionalSignalRuntime,
 } = createPluginRuntimeStore<PluginRuntime>({
   pluginId: "signal",
   errorMessage: "Signal runtime not initialized",
 });
-export { clearSignalRuntime, getSignalRuntime, setSignalRuntime };
+export { getOptionalSignalRuntime, getSignalRuntime, setSignalRuntime };

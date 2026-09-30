@@ -3,13 +3,13 @@ import {
   type ProviderRequestTransportOverrides,
 } from "openclaw/plugin-sdk/provider-http";
 import { parseGeminiAuth } from "./gemini-auth.js";
-export { parseGeminiAuth };
-export { applyGoogleGeminiModelDefault, GOOGLE_GEMINI_DEFAULT_MODEL } from "./onboard.js";
+import { resolveGoogleApiClientHeaders } from "./google-api-client-header.js";
 import {
   DEFAULT_GOOGLE_API_BASE_URL,
-  normalizeGoogleApiBaseUrl,
   normalizeGoogleGenerativeAiBaseUrl,
 } from "./provider-policy.js";
+export { parseGeminiAuth };
+export { applyGoogleGeminiModelDefault, GOOGLE_GEMINI_DEFAULT_MODEL } from "./onboard.js";
 export { normalizeAntigravityModelId, normalizeGoogleModelId } from "./model-id.js";
 export {
   createGoogleThinkingPayloadWrapper,
@@ -31,6 +31,8 @@ export {
 export {
   DEFAULT_GOOGLE_API_BASE_URL,
   isGoogleGenerativeAiApi,
+  isGoogleVertexBaseUrl,
+  isGoogleVertexHostname,
   normalizeGoogleApiBaseUrl,
   normalizeGoogleGenerativeAiBaseUrl,
   normalizeGoogleProviderConfig,
@@ -47,9 +49,7 @@ type GoogleGenerativeAiRequestOverrides = ProviderRequestTransportOverrides & {
 };
 
 function resolveTrustedGoogleGenerativeAiBaseUrl(baseUrl?: string): string {
-  const normalized =
-    normalizeGoogleGenerativeAiBaseUrl(baseUrl ?? DEFAULT_GOOGLE_API_BASE_URL) ??
-    DEFAULT_GOOGLE_API_BASE_URL;
+  const normalized = normalizeGoogleGenerativeAiBaseUrl(baseUrl) ?? DEFAULT_GOOGLE_API_BASE_URL;
   let url: URL;
   try {
     url = new URL(normalized);
@@ -77,13 +77,22 @@ export function resolveGoogleGenerativeAiHttpRequestConfig(params: {
   capability: "image" | "audio" | "video";
   transport: "http" | "media-understanding";
 }) {
+  const baseUrl = resolveTrustedGoogleGenerativeAiBaseUrl(params.baseUrl);
   return resolveProviderHttpRequestConfig({
-    baseUrl: resolveTrustedGoogleGenerativeAiBaseUrl(params.baseUrl),
+    baseUrl,
     defaultBaseUrl: DEFAULT_GOOGLE_API_BASE_URL,
     allowPrivateNetwork: params.request?.allowPrivateNetwork,
     headers: params.headers,
     request: params.request,
-    defaultHeaders: parseGeminiAuth(params.apiKey).headers,
+    defaultHeaders: {
+      ...parseGeminiAuth(params.apiKey).headers,
+      ...resolveGoogleApiClientHeaders({
+        baseUrl,
+        api: "google-generative-ai",
+        capability: params.capability,
+        transport: params.transport,
+      }),
+    },
     provider: "google",
     api: "google-generative-ai",
     capability: params.capability,

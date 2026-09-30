@@ -89,6 +89,16 @@ enum OverlayPanelFactory {
         completion: @escaping @MainActor @Sendable () -> Void)
     {
         let target = window.frame.offsetBy(dx: offsetX, dy: offsetY)
+        self.animateDismiss(window: window, to: target, duration: duration, completion: completion)
+    }
+
+    @MainActor
+    static func animateDismiss(
+        window: NSWindow,
+        to target: NSRect,
+        duration: TimeInterval,
+        completion: @escaping @MainActor @Sendable () -> Void)
+    {
         NSAnimationContext.runAnimationGroup { context in
             context.duration = duration
             context.timingFunction = CAMediaTimingFunction(name: .easeOut)
@@ -102,12 +112,11 @@ enum OverlayPanelFactory {
     @MainActor
     static func animateDismissAndHide(
         window: NSWindow,
-        offsetX: CGFloat = 6,
-        offsetY: CGFloat = 6,
-        duration: TimeInterval = 0.16,
+        to target: NSRect,
+        duration: TimeInterval,
         onHidden: @escaping @MainActor () -> Void)
     {
-        self.animateDismiss(window: window, offsetX: offsetX, offsetY: offsetY, duration: duration) {
+        self.animateDismiss(window: window, to: target, duration: duration) {
             window.orderOut(nil)
             onHidden()
         }

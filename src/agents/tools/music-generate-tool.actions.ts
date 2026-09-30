@@ -1,18 +1,18 @@
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { listSupportedMusicGenerationModes } from "../../music-generation/capabilities.js";
 import { listRuntimeMusicGenerationProviders } from "../../music-generation/runtime.js";
+import type { AuthProfileStore } from "../auth-profiles/types.js";
 import {
   buildMusicGenerationTaskStatusDetails,
   buildMusicGenerationTaskStatusText,
   findActiveMusicGenerationTaskForSession,
-} from "../music-generation-task-status.js";
+  findDuplicateGuardMusicGenerationTaskForSession,
+} from "../media-generation-task-status.js";
 import {
   createMediaGenerateProviderListActionResult,
-  createMediaGenerateTaskStatusActions,
+  createMediaGenerateTaskActions,
   type MediaGenerateActionResult,
 } from "./media-generate-tool-actions-shared.js";
-
-type MusicGenerateActionResult = MediaGenerateActionResult;
 
 function summarizeMusicGenerationCapabilities(
   provider: ReturnType<typeof listRuntimeMusicGenerationProviders>[number],
@@ -26,7 +26,18 @@ function summarizeMusicGenerationCapabilities(
     edit?.maxInputImages ? `maxInputImages=${edit.maxInputImages}` : null,
     generate?.maxDurationSeconds ? `maxDurationSeconds=${generate.maxDurationSeconds}` : null,
     generate?.supportsLyrics ? "lyrics" : null,
+    generate?.supportsLyricsByModel && Object.keys(generate.supportsLyricsByModel).length > 0
+      ? `supportsLyricsByModel=${Object.entries(generate.supportsLyricsByModel)
+          .map(([modelId, supported]) => `${modelId}:${supported}`)
+          .join("; ")}`
+      : null,
     generate?.supportsInstrumental ? "instrumental" : null,
+    generate?.supportsInstrumentalByModel &&
+    Object.keys(generate.supportsInstrumentalByModel).length > 0
+      ? `supportsInstrumentalByModel=${Object.entries(generate.supportsInstrumentalByModel)
+          .map(([modelId, supported]) => `${modelId}:${supported}`)
+          .join("; ")}`
+      : null,
     generate?.supportsDuration ? "duration" : null,
     generate?.supportsFormat ? "format" : null,
     generate?.supportedFormats?.length
@@ -45,31 +56,32 @@ function summarizeMusicGenerationCapabilities(
 
 export function createMusicGenerateListActionResult(
   config?: OpenClawConfig,
-): MusicGenerateActionResult {
+  options?: { workspaceDir?: string; agentDir?: string; authStore?: AuthProfileStore },
+): MediaGenerateActionResult {
   const providers = listRuntimeMusicGenerationProviders({ config });
   return createMediaGenerateProviderListActionResult({
+    kind: "music_generation",
     providers,
     emptyText: "No music-generation providers are registered.",
+    cfg: config,
+    workspaceDir: options?.workspaceDir,
+    agentDir: options?.agentDir,
+    authStore: options?.authStore,
     listModes: listSupportedMusicGenerationModes,
     summarizeCapabilities: summarizeMusicGenerationCapabilities,
   });
 }
 
-const musicGenerateTaskStatusActions = createMediaGenerateTaskStatusActions({
+export const {
+  createStatusActionResult: createMusicGenerateStatusActionResult,
+  createDuplicateGuardResult: createMusicGenerateDuplicateGuardResult,
+} = createMediaGenerateTaskActions({
   inactiveText: "No active music generation task is currently running for this session.",
-  findActiveTask: (sessionKey) => findActiveMusicGenerationTaskForSession(sessionKey) ?? undefined,
+  findActiveTask: (sessionKey, agentId) =>
+    findActiveMusicGenerationTaskForSession(sessionKey, { agentId }),
+  // Prompt-only imports must not resolve duplicate guards until an action runs.
+  findDuplicateTask: (sessionKey, request) =>
+    findDuplicateGuardMusicGenerationTaskForSession(sessionKey, request),
   buildStatusText: buildMusicGenerationTaskStatusText,
   buildStatusDetails: buildMusicGenerationTaskStatusDetails,
 });
-
-export function createMusicGenerateStatusActionResult(
-  sessionKey?: string,
-): MusicGenerateActionResult {
-  return musicGenerateTaskStatusActions.createStatusActionResult(sessionKey);
-}
-
-export function createMusicGenerateDuplicateGuardResult(
-  sessionKey?: string,
-): MusicGenerateActionResult | undefined {
-  return musicGenerateTaskStatusActions.createDuplicateGuardResult(sessionKey);
-}

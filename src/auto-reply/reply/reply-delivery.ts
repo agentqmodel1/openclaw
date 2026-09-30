@@ -1,16 +1,50 @@
-import { resolveSendableOutboundReplyParts } from "openclaw/plugin-sdk/reply-payload";
+/** Delivers prepared block replies through streaming or direct paths. */
+import { hasOutboundReplyContent } from "openclaw/plugin-sdk/reply-payload";
 import { logVerbose } from "../../globals.js";
-import { getReplyPayloadMetadata, setReplyPayloadMetadata } from "../reply-payload.js";
-import { SILENT_REPLY_TOKEN } from "../tokens.js";
+import { trimTextPreservingCode } from "../../shared/text/text-projection.js";
+import {
+  copyReplyPayloadMetadata,
+  getReplyPayloadMetadata,
+  isRenderablePayload,
+  isReplyPayloadTerminalContent,
+  setReplyPayloadMetadata,
+} from "../reply-payload.js";
+import { isSilentReplyPayloadText, isSilentReplyText, SILENT_REPLY_TOKEN } from "../tokens.js";
 import type { BlockReplyContext, ReplyPayload, ReplyThreadingPolicy } from "../types.js";
+import { deliverBlockReply } from "./block-reply-delivery.js";
 import type { BlockReplyPipeline } from "./block-reply-pipeline.js";
-import { createBlockReplyContentKey } from "./block-reply-pipeline.js";
 import { parseReplyDirectives } from "./reply-directives.js";
-import { applyReplyTagsToPayload, isRenderablePayload } from "./reply-payloads.js";
+import {
+  ReplyDispatchDeliveryError,
+  resolveReplyDispatchErrorOutcome,
+  shouldRetryReplyDispatch,
+} from "./reply-dispatch-outcome.js";
 import type { TypingSignaler } from "./typing-mode.js";
 
-export type ReplyDirectiveParseMode = "always" | "auto" | "never";
+type ReplyDirectiveParseMode = "always" | "auto" | "never";
 
+export type DirectBlockDelivery = Awaited<ReturnType<typeof deliverBlockReply>> & {
+  payload: ReplyPayload;
+  /** Captured at settlement; later source-completeness changes do not rewrite this fact. */
+  terminalDeliveryConfirmed?: true;
+};
+
+/** Visible progress needs a failure outcome, but retained or suppressed sends are not visibility. */
+export async function resolveReplyFailureVisibility(
+  resolveVisibleReplyDelivery: (() => Promise<boolean>) | undefined,
+  directBlockDeliveries: readonly DirectBlockDelivery[],
+): Promise<boolean> {
+  return (
+    (await resolveVisibleReplyDelivery?.()) === true ||
+    directBlockDeliveries.some(
+      (delivery) =>
+        delivery.outcome === "delivered" &&
+        hasOutboundReplyContent(delivery.payload, { trimText: true }),
+    )
+  );
+}
+
+/** Parses inline reply directives into payload fields and silent-reply state. */
 export function normalizeReplyPayloadDirectives(params: {
   payload: ReplyPayload;
   currentMessageId?: string;
@@ -18,6 +52,7 @@ export function normalizeReplyPayloadDirectives(params: {
   trimLeadingWhitespace?: boolean;
   parseMode?: ReplyDirectiveParseMode;
   extractMarkdownImages?: boolean;
+  extractMediaDirectives?: boolean;
 }): { payload: ReplyPayload; isSilent: boolean } {
   const parseMode = params.parseMode ?? "always";
   const silentToken = params.silentToken ?? SILENT_REPLY_TOKEN;
@@ -27,7 +62,7 @@ export function normalizeReplyPayloadDirectives(params: {
     parseMode === "always" ||
     (parseMode === "auto" &&
       (sourceText.includes("[[") ||
-        /media:/i.test(sourceText) ||
+        (params.extractMediaDirectives !== false && /media:/i.test(sourceText)) ||
         (params.extractMarkdownImages === true && /!\[[^\]]*]\(/.test(sourceText)) ||
         sourceText.includes(silentToken)));
 
@@ -36,19 +71,20 @@ export function normalizeReplyPayloadDirectives(params: {
         currentMessageId: params.currentMessageId,
         silentToken,
         extractMarkdownImages: params.extractMarkdownImages,
+        extractMediaDirectives: params.extractMediaDirectives,
       })
     : undefined;
 
   let text = parsed ? parsed.text || undefined : params.payload.text || undefined;
   if (params.trimLeadingWhitespace && text) {
-    text = text.trimStart() || undefined;
+    text = trimTextPreservingCode(text, "start") || undefined;
   }
 
   const mediaUrls = params.payload.mediaUrls ?? parsed?.mediaUrls;
-  const mediaUrl = params.payload.mediaUrl ?? parsed?.mediaUrl ?? mediaUrls?.[0];
+  const mediaUrl = params.payload.mediaUrl ?? parsed?.mediaUrls?.[0] ?? mediaUrls?.[0];
 
   return {
-    payload: {
+    payload: copyReplyPayloadMetadata(params.payload, {
       ...params.payload,
       text,
       mediaUrls,
@@ -57,26 +93,51 @@ export function normalizeReplyPayloadDirectives(params: {
       replyToTag: params.payload.replyToTag || parsed?.replyToTag,
       replyToCurrent: params.payload.replyToCurrent || parsed?.replyToCurrent,
       audioAsVoice: Boolean(params.payload.audioAsVoice || parsed?.audioAsVoice),
-    },
+    }),
     isSilent: parsed?.isSilent ?? false,
   };
 }
 
-function carryReplyPayloadMetadata(source: ReplyPayload, target: ReplyPayload): ReplyPayload {
-  const metadata = getReplyPayloadMetadata(source);
-  return metadata ? setReplyPayloadMetadata(target, metadata) : target;
-}
-
 async function sendDirectBlockReply(params: {
   onBlockReply: (payload: ReplyPayload, context?: BlockReplyContext) => Promise<void> | void;
-  directlySentBlockKeys: Set<string>;
-  trackingPayload: ReplyPayload;
+  directBlockDeliveries: DirectBlockDelivery[];
   payload: ReplyPayload;
+  context?: BlockReplyContext;
 }) {
-  params.directlySentBlockKeys.add(createBlockReplyContentKey(params.trackingPayload));
-  await params.onBlockReply(params.payload);
+  const attempt: DirectBlockDelivery = {
+    payload: params.payload,
+    outcome: "failed-deliver",
+    pending: true,
+  };
+  params.directBlockDeliveries.push(attempt);
+  const delivery = await deliverBlockReply(() =>
+    params.context
+      ? params.onBlockReply(params.payload, params.context)
+      : params.onBlockReply(params.payload),
+  ).catch((error: unknown) => {
+    attempt.outcome = resolveReplyDispatchErrorOutcome(error);
+    attempt.pending = false;
+    throw error;
+  });
+  Object.assign(attempt, delivery, { pending: delivery.pending === true });
+  if (
+    params.context?.deliveryIntentId !== undefined &&
+    !delivery.pending &&
+    shouldRetryReplyDispatch(delivery.outcome)
+  ) {
+    throw new ReplyDispatchDeliveryError(delivery.outcome);
+  }
+  if (
+    delivery.outcome === "delivered" &&
+    !delivery.pending &&
+    delivery.source?.complete !== false &&
+    isReplyPayloadTerminalContent(params.payload)
+  ) {
+    attempt.terminalDeliveryConfirmed = true;
+  }
 }
 
+/** Creates the handler used for assistant block replies during streaming/tool phases. */
 export function createBlockReplyDeliveryHandler(params: {
   onBlockReply: (payload: ReplyPayload, context?: BlockReplyContext) => Promise<void> | void;
   currentMessageId?: string;
@@ -85,13 +146,34 @@ export function createBlockReplyDeliveryHandler(params: {
   applyReplyToMode: (payload: ReplyPayload) => ReplyPayload;
   normalizeMediaPaths?: (payload: ReplyPayload) => Promise<ReplyPayload>;
   typingSignals: TypingSignaler;
+  reasoningPayloadsEnabled?: boolean;
+  commentaryPayloadsEnabled?: boolean;
   blockStreamingEnabled: boolean;
   blockReplyPipeline: BlockReplyPipeline | null;
-  directlySentBlockKeys: Set<string>;
-}): (payload: ReplyPayload) => Promise<void> {
-  return async (payload) => {
+  directBlockDeliveries: DirectBlockDelivery[];
+}): (
+  payload: ReplyPayload,
+  options?: BlockReplyContext & { completed?: boolean },
+) => Promise<void> {
+  return async (payload, options) => {
+    // Suppressed display lanes must not enter delivery bookkeeping: callers use
+    // that evidence to decide whether an otherwise empty turn needs a fallback.
+    if (
+      (payload.isReasoning === true && params.reasoningPayloadsEnabled !== true) ||
+      (payload.isCommentary === true && params.commentaryPayloadsEnabled !== true)
+    ) {
+      return;
+    }
     const { text, skip } = params.normalizeStreamingText(payload);
-    if (skip && !resolveSendableOutboundReplyParts(payload).hasMedia) {
+    const isSilent =
+      getReplyPayloadMetadata(payload)?.silentReply === true ||
+      isSilentReplyText(payload.text, SILENT_REPLY_TOKEN) ||
+      (skip && isSilentReplyPayloadText(text, SILENT_REPLY_TOKEN));
+    if (
+      skip &&
+      !hasOutboundReplyContent({ ...payload, text: undefined }) &&
+      !payload.audioAsVoice
+    ) {
       return;
     }
 
@@ -101,74 +183,85 @@ export function createBlockReplyDeliveryHandler(params: {
         : payload.replyToCurrent === false
           ? false
           : params.replyThreading?.implicitCurrentMessage !== "deny";
+    // Reply-to-current is implicit for block replies unless per-turn threading disables it.
 
-    const taggedPayload = applyReplyTagsToPayload(
-      {
-        ...payload,
-        text,
-        mediaUrl: payload.mediaUrl ?? payload.mediaUrls?.[0],
-        replyToId:
-          payload.replyToId ??
-          (implicitCurrentMessageAllowed ? params.currentMessageId : undefined),
-      },
-      params.currentMessageId,
-    );
+    const normalizedText = text ? trimTextPreservingCode(text, "start") : undefined;
+    const normalizedPayload = copyReplyPayloadMetadata(payload, {
+      ...payload,
+      text: isSilent ? undefined : normalizedText || undefined,
+      audioAsVoice: Boolean(payload.audioAsVoice),
+      mediaUrl: payload.mediaUrl ?? payload.mediaUrls?.[0],
+      replyToId:
+        payload.replyToId ?? (implicitCurrentMessageAllowed ? params.currentMessageId : undefined),
+    });
 
     // Let through payloads with audioAsVoice flag even if empty (need to track it).
-    if (!isRenderablePayload(taggedPayload) && !payload.audioAsVoice) {
+    if (!isRenderablePayload(normalizedPayload) && !payload.audioAsVoice) {
       return;
     }
 
-    const normalized = normalizeReplyPayloadDirectives({
-      payload: taggedPayload,
-      currentMessageId: params.currentMessageId,
-      silentToken: SILENT_REPLY_TOKEN,
-      trimLeadingWhitespace: true,
-      parseMode: "auto",
-    });
-
     const mediaNormalizedPayload = params.normalizeMediaPaths
-      ? await params.normalizeMediaPaths(normalized.payload)
-      : normalized.payload;
-    const blockPayload = carryReplyPayloadMetadata(
+      ? await params.normalizeMediaPaths(normalizedPayload)
+      : normalizedPayload;
+    if (isSilent) {
+      mediaNormalizedPayload.text = undefined;
+    }
+    const blockPayload = copyReplyPayloadMetadata(
       payload,
       params.applyReplyToMode(mediaNormalizedPayload),
     );
-    const blockHasMedia = resolveSendableOutboundReplyParts(blockPayload).hasMedia;
+    if (blockPayload.text?.trim() !== payload.text?.trim()) {
+      setReplyPayloadMetadata(blockPayload, {
+        blockSourceText: undefined,
+        blockSourceRange: undefined,
+      });
+    }
+    const blockHasNonTextContent = hasOutboundReplyContent({ ...blockPayload, text: undefined });
 
     // Skip empty payloads unless they have audioAsVoice flag (need to track it).
-    if (!blockPayload.text && !blockHasMedia && !blockPayload.audioAsVoice) {
-      return;
-    }
-    if (normalized.isSilent && !blockHasMedia) {
+    if (!blockPayload.text && !blockHasNonTextContent && !blockPayload.audioAsVoice) {
       return;
     }
 
     if (blockPayload.text) {
-      void params.typingSignals.signalTextDelta(blockPayload.text).catch((err) => {
+      void params.typingSignals.signalTextDelta(blockPayload.text).catch((err: unknown) => {
         logVerbose(`block reply typing signal failed: ${String(err)}`);
       });
     }
 
-    // Use pipeline if available (block streaming enabled), otherwise send directly.
-    if (params.blockStreamingEnabled && params.blockReplyPipeline) {
-      params.blockReplyPipeline.enqueue(blockPayload);
-    } else if (params.blockStreamingEnabled) {
-      // Send directly when flushing before tool execution (no pipeline but streaming enabled).
-      // Track sent key to avoid duplicate in final payloads.
-      await sendDirectBlockReply({
-        onBlockReply: params.onBlockReply,
-        directlySentBlockKeys: params.directlySentBlockKeys,
-        trackingPayload: blockPayload,
-        payload: blockPayload,
+    // Independent messages keep their own delivery identity and never join answer chunks.
+    if (options?.deliveryIntentId !== undefined) {
+      setReplyPayloadMetadata(blockPayload, {
+        independentDeliveryIntentId: options.deliveryIntentId,
       });
-    } else if (blockHasMedia && !blockPayload.text) {
-      // Media-only block replies (for example orphaned tool attachments) are not reconstructible
-      // from the assistant's final text, so they still need a direct fallback when streaming is off.
       await sendDirectBlockReply({
         onBlockReply: params.onBlockReply,
-        directlySentBlockKeys: params.directlySentBlockKeys,
-        trackingPayload: blockPayload,
+        directBlockDeliveries: params.directBlockDeliveries,
+        payload: blockPayload,
+        context: options,
+      });
+    } else if (params.blockStreamingEnabled && params.blockReplyPipeline) {
+      if (options?.completed) {
+        // A completed answer is a delivery boundary, not another streaming chunk.
+        // Keep prior commentary separate and do not wait for a size/idle threshold.
+        await params.blockReplyPipeline.flush({ force: true });
+      }
+      params.blockReplyPipeline.enqueue(blockPayload);
+      if (options?.completed) {
+        await params.blockReplyPipeline.flush({ force: true });
+      }
+    } else if (
+      params.blockStreamingEnabled ||
+      options?.completed === true ||
+      blockHasNonTextContent ||
+      blockPayload.isReasoning === true ||
+      blockPayload.isCommentary === true
+    ) {
+      // Enabled display lanes never merge into final text, so deliver them directly
+      // even when block streaming is off.
+      await sendDirectBlockReply({
+        onBlockReply: params.onBlockReply,
+        directBlockDeliveries: params.directBlockDeliveries,
         payload: blockPayload,
       });
     }

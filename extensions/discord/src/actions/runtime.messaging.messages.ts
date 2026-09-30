@@ -1,10 +1,14 @@
 import {
   jsonResult,
-  readNumberParam,
+  readPositiveIntegerParam,
   readStringArrayParam,
   readStringParam,
-} from "../runtime-api.js";
-import { discordMessagingActionRuntime } from "./runtime.messaging.runtime.js";
+} from "openclaw/plugin-sdk/channel-actions";
+import { createChannelProgressDraftCompositor } from "openclaw/plugin-sdk/channel-outbound";
+import { isRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
+import * as discordMessagingActionRuntime from "../send.js";
+import { buildDiscordTextChunks } from "../send.shared.js";
+import { resolveDiscordChannelId } from "../targets.js";
 import type { DiscordMessagingActionContext } from "./runtime.messaging.shared.js";
 
 function parseDiscordMessageLink(link: string) {
@@ -31,6 +35,7 @@ export async function handleDiscordMessageManagementAction(ctx: DiscordMessaging
         throw new Error("Discord permissions are disabled.");
       }
       const channelId = ctx.resolveChannelId();
+      await ctx.assertReadTargetAllowed({ channelId });
       const permissions = await discordMessagingActionRuntime.fetchChannelPermissionsDiscord(
         channelId,
         ctx.withOpts(),
@@ -56,6 +61,7 @@ export async function handleDiscordMessageManagementAction(ctx: DiscordMessaging
           "Discord message fetch requires guildId, channelId, and messageId (or a valid messageLink).",
         );
       }
+      await ctx.assertReadTargetAllowed({ guildId, channelId });
       const message = await discordMessagingActionRuntime.fetchMessageDiscord(
         channelId,
         messageId,
@@ -74,19 +80,26 @@ export async function handleDiscordMessageManagementAction(ctx: DiscordMessaging
         throw new Error("Discord message reads are disabled.");
       }
       const channelId = ctx.resolveChannelId();
+      await ctx.assertReadTargetAllowed({ channelId });
+      const messageId = readStringParam(ctx.params, "messageId");
       const query = {
-        limit: readNumberParam(ctx.params, "limit"),
+        limit: readPositiveIntegerParam(ctx.params, "limit"),
         before: readStringParam(ctx.params, "before"),
         after: readStringParam(ctx.params, "after"),
         around: readStringParam(ctx.params, "around"),
       };
-      const messages = await discordMessagingActionRuntime.readMessagesDiscord(
-        channelId,
-        query,
-        ctx.withOpts(),
-      );
+      const messages = messageId
+        ? [
+            await discordMessagingActionRuntime.fetchMessageDiscord(
+              channelId,
+              messageId,
+              ctx.withOpts(),
+            ),
+          ]
+        : await discordMessagingActionRuntime.readMessagesDiscord(channelId, query, ctx.withOpts());
       return jsonResult({
         ok: true,
+        channelId,
         messages: messages.map((message) => ctx.normalizeMessage(message)),
       });
     }
@@ -98,13 +111,31 @@ export async function handleDiscordMessageManagementAction(ctx: DiscordMessaging
       const messageId = readStringParam(ctx.params, "messageId", {
         required: true,
       });
-      const content = readStringParam(ctx.params, "content", {
-        required: true,
-      });
+      const snapshot = ctx.options?.progressSnapshot;
+      const content = snapshot
+        ? (buildDiscordTextChunks(
+            createChannelProgressDraftCompositor({
+              entry: ctx.accountConfig,
+              mode: "progress",
+              active: true,
+              seed: `${ctx.accountId}:${channelId}`,
+              initialSnapshot: snapshot,
+            }).getText(),
+            {
+              maxChars: Math.min(ctx.accountConfig.textChunkLimit ?? 2000, 2000),
+              maxLinesPerMessage: Number.MAX_SAFE_INTEGER,
+            },
+          )[0] ?? "")
+        : readStringParam(ctx.params, "content", {
+            required: true,
+            allowEmpty: true,
+            trim: false,
+          });
+      await ctx.assertReadTargetAllowed({ channelId });
       const message = await discordMessagingActionRuntime.editMessageDiscord(
         channelId,
         messageId,
-        { content },
+        { content, ...(snapshot ? { allowedMentions: { parse: [] } } : {}) },
         ctx.withOpts(),
       );
       return jsonResult({ ok: true, message });
@@ -117,6 +148,7 @@ export async function handleDiscordMessageManagementAction(ctx: DiscordMessaging
       const messageId = readStringParam(ctx.params, "messageId", {
         required: true,
       });
+      await ctx.assertReadTargetAllowed({ channelId });
       await discordMessagingActionRuntime.deleteMessageDiscord(
         channelId,
         messageId,
@@ -124,17 +156,7 @@ export async function handleDiscordMessageManagementAction(ctx: DiscordMessaging
       );
       return jsonResult({ ok: true });
     }
-    case "pinMessage": {
-      if (!ctx.isActionEnabled("pins")) {
-        throw new Error("Discord pins are disabled.");
-      }
-      const channelId = ctx.resolveChannelId();
-      const messageId = readStringParam(ctx.params, "messageId", {
-        required: true,
-      });
-      await discordMessagingActionRuntime.pinMessageDiscord(channelId, messageId, ctx.withOpts());
-      return jsonResult({ ok: true });
-    }
+    case "pinMessage":
     case "unpinMessage": {
       if (!ctx.isActionEnabled("pins")) {
         throw new Error("Discord pins are disabled.");
@@ -143,7 +165,12 @@ export async function handleDiscordMessageManagementAction(ctx: DiscordMessaging
       const messageId = readStringParam(ctx.params, "messageId", {
         required: true,
       });
-      await discordMessagingActionRuntime.unpinMessageDiscord(channelId, messageId, ctx.withOpts());
+      await ctx.assertReadTargetAllowed({ channelId });
+      const mutate =
+        ctx.action === "pinMessage"
+          ? discordMessagingActionRuntime.pinMessageDiscord
+          : discordMessagingActionRuntime.unpinMessageDiscord;
+      await mutate(channelId, messageId, ctx.withOpts());
       return jsonResult({ ok: true });
     }
     case "listPins": {
@@ -151,6 +178,7 @@ export async function handleDiscordMessageManagementAction(ctx: DiscordMessaging
         throw new Error("Discord pins are disabled.");
       }
       const channelId = ctx.resolveChannelId();
+      await ctx.assertReadTargetAllowed({ channelId });
       const pins = await discordMessagingActionRuntime.listPinsDiscord(channelId, ctx.withOpts());
       return jsonResult({ ok: true, pins: pins.map((pin) => ctx.normalizeMessage(pin)) });
     }
@@ -158,18 +186,54 @@ export async function handleDiscordMessageManagementAction(ctx: DiscordMessaging
       if (!ctx.isActionEnabled("search")) {
         throw new Error("Discord search is disabled.");
       }
-      const guildId = readStringParam(ctx.params, "guildId", {
-        required: true,
-      });
-      const content = readStringParam(ctx.params, "content", {
-        required: true,
-      });
+      let guildId = readStringParam(ctx.params, "guildId");
+      const content =
+        readStringParam(ctx.params, "content") ?? readStringParam(ctx.params, "query");
+      if (!content) {
+        throw new Error("Discord search requires content or query text.");
+      }
       const channelId = readStringParam(ctx.params, "channelId");
       const channelIds = readStringArrayParam(ctx.params, "channelIds");
+      // Resolve guildId from channel info when not explicitly provided.
+      if (!guildId) {
+        const rawInferChannelId = channelId ?? channelIds?.[0];
+        if (rawInferChannelId) {
+          try {
+            const inferChannelId = resolveDiscordChannelId(rawInferChannelId);
+            const channelInfo = await discordMessagingActionRuntime.fetchChannelInfoDiscord(
+              inferChannelId,
+              ctx.withOpts(),
+            );
+            if (isRecord(channelInfo)) {
+              const resolved = channelInfo.guild_id ?? channelInfo.guildId;
+              if (typeof resolved === "string" && resolved.trim()) {
+                guildId = resolved.trim();
+              }
+            }
+          } catch {
+            // Channel info fetch failed; fall through to descriptive error.
+          }
+        }
+      }
+      if (!guildId) {
+        throw new Error(
+          "Discord search requires guildId. Provide guildId explicitly, or provide channelId so the guild can be resolved from the channel.",
+        );
+      }
       const authorId = readStringParam(ctx.params, "authorId");
       const authorIds = readStringArrayParam(ctx.params, "authorIds");
-      const limit = readNumberParam(ctx.params, "limit");
-      const channelIdList = [...(channelIds ?? []), ...(channelId ? [channelId] : [])];
+      const limit = readPositiveIntegerParam(ctx.params, "limit");
+      const channelIdList = [
+        ...(channelIds ?? []).map((id) => resolveDiscordChannelId(id)),
+        ...(channelId ? [resolveDiscordChannelId(channelId)] : []),
+      ];
+      if (channelIdList.length > 0) {
+        for (const targetChannelId of channelIdList) {
+          await ctx.assertReadTargetAllowed({ guildId, channelId: targetChannelId });
+        }
+      } else {
+        await ctx.assertGuildReadTargetAllowed({ guildId });
+      }
       const authorIdList = [...(authorIds ?? []), ...(authorId ? [authorId] : [])];
       const results = await discordMessagingActionRuntime.searchMessagesDiscord(
         {
@@ -181,11 +245,7 @@ export async function handleDiscordMessageManagementAction(ctx: DiscordMessaging
         },
         ctx.withOpts(),
       );
-      if (!results || typeof results !== "object") {
-        return jsonResult({ ok: true, results });
-      }
-      const resultsRecord = results as Record<string, unknown>;
-      const messages = resultsRecord.messages;
+      const messages = results.messages;
       const normalizedMessages = Array.isArray(messages)
         ? messages.map((group) =>
             Array.isArray(group) ? group.map((msg) => ctx.normalizeMessage(msg)) : group,
@@ -194,7 +254,7 @@ export async function handleDiscordMessageManagementAction(ctx: DiscordMessaging
       return jsonResult({
         ok: true,
         results: {
-          ...resultsRecord,
+          ...results,
           messages: normalizedMessages,
         },
       });

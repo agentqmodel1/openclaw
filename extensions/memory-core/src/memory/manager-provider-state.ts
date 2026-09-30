@@ -1,35 +1,87 @@
+// Memory Core provider module implements model/runtime integration.
 import type {
   OpenClawConfig,
   ResolvedMemorySearchConfig,
 } from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
 import {
   resolveEmbeddingProviderFallbackModel,
+  resolveEmbeddingProviderFallbackRemote,
   type EmbeddingProvider,
   type EmbeddingProviderResult,
   type EmbeddingProviderRuntime,
 } from "./embeddings.js";
 
-export type MemoryResolvedProviderState = {
+type MemoryResolvedProviderState = {
   provider: EmbeddingProvider | null;
   fallbackFrom?: string;
   fallbackReason?: string;
   providerUnavailableReason?: string;
   providerRuntime?: EmbeddingProviderRuntime;
+  lifecycle: MemoryProviderLifecycleState;
 };
+
+export type MemoryProviderLifecycleState =
+  | {
+      mode: "pending";
+      requestedProvider: string;
+    }
+  | {
+      mode: "active";
+      providerId: string;
+    }
+  | {
+      mode: "degraded";
+      providerId: string;
+      reason: string;
+      code?: string;
+    }
+  | {
+      mode: "fallback-active";
+      providerId: string;
+      fallbackFrom: string;
+      reason: string;
+    }
+  | {
+      mode: "fts-only";
+      reason: string;
+      attemptedProviderId?: string;
+    };
+
+function resolveProviderLifecycle(result: EmbeddingProviderResult): MemoryProviderLifecycleState {
+  if (result.provider && result.fallbackFrom) {
+    return {
+      mode: "fallback-active",
+      providerId: result.provider.id,
+      fallbackFrom: result.fallbackFrom,
+      reason: result.fallbackReason ?? "fallback activated",
+    };
+  }
+  if (result.provider) {
+    return { mode: "active", providerId: result.provider.id };
+  }
+  return {
+    mode: "fts-only",
+    reason: result.providerUnavailableReason ?? "No embedding provider available",
+    attemptedProviderId: result.requestedProvider,
+  };
+}
+
+export function resolveFallbackCurrentProviderId(params: {
+  provider: EmbeddingProvider | null;
+  lifecycle: MemoryProviderLifecycleState;
+}): string | null {
+  if (params.provider) {
+    return params.provider.id;
+  }
+  if (params.lifecycle.mode === "degraded") {
+    return params.lifecycle.providerId;
+  }
+  return null;
+}
 
 export function resolveMemoryPrimaryProviderRequest(params: {
   settings: ResolvedMemorySearchConfig;
-}): {
-  provider: string;
-  model: string;
-  remote: ResolvedMemorySearchConfig["remote"];
-  inputType: ResolvedMemorySearchConfig["inputType"];
-  queryInputType: ResolvedMemorySearchConfig["queryInputType"];
-  documentInputType: ResolvedMemorySearchConfig["documentInputType"];
-  outputDimensionality: ResolvedMemorySearchConfig["outputDimensionality"];
-  fallback: ResolvedMemorySearchConfig["fallback"];
-  local: ResolvedMemorySearchConfig["local"];
-} {
+}) {
   return {
     provider: params.settings.provider,
     model: params.settings.model,
@@ -44,10 +96,7 @@ export function resolveMemoryPrimaryProviderRequest(params: {
 }
 
 export function resolveMemoryProviderState(
-  result: Pick<
-    EmbeddingProviderResult,
-    "provider" | "fallbackFrom" | "fallbackReason" | "providerUnavailableReason" | "runtime"
-  >,
+  result: EmbeddingProviderResult,
 ): MemoryResolvedProviderState {
   return {
     provider: result.provider,
@@ -55,21 +104,7 @@ export function resolveMemoryProviderState(
     fallbackReason: result.fallbackReason,
     providerUnavailableReason: result.providerUnavailableReason,
     providerRuntime: result.runtime,
-  };
-}
-
-export function applyMemoryFallbackProviderState(params: {
-  current: MemoryResolvedProviderState;
-  fallbackFrom: string;
-  reason: string;
-  result: Pick<EmbeddingProviderResult, "provider" | "runtime">;
-}): MemoryResolvedProviderState {
-  return {
-    ...params.current,
-    fallbackFrom: params.fallbackFrom,
-    fallbackReason: params.reason,
-    provider: params.result.provider,
-    providerRuntime: params.result.runtime,
+    lifecycle: resolveProviderLifecycle(result),
   };
 }
 
@@ -77,17 +112,7 @@ export function resolveMemoryFallbackProviderRequest(params: {
   cfg: OpenClawConfig;
   settings: ResolvedMemorySearchConfig;
   currentProviderId: string | null;
-}): {
-  provider: string;
-  model: string;
-  remote: ResolvedMemorySearchConfig["remote"];
-  inputType: ResolvedMemorySearchConfig["inputType"];
-  queryInputType: ResolvedMemorySearchConfig["queryInputType"];
-  documentInputType: ResolvedMemorySearchConfig["documentInputType"];
-  outputDimensionality: ResolvedMemorySearchConfig["outputDimensionality"];
-  fallback: "none";
-  local: ResolvedMemorySearchConfig["local"];
-} | null {
+}) {
   const fallback = params.settings.fallback;
   if (
     !fallback ||
@@ -100,12 +125,12 @@ export function resolveMemoryFallbackProviderRequest(params: {
   return {
     provider: fallback,
     model: resolveEmbeddingProviderFallbackModel(fallback, params.settings.model, params.cfg),
-    remote: params.settings.remote,
+    remote: resolveEmbeddingProviderFallbackRemote(params.settings.remote),
     inputType: params.settings.inputType,
     queryInputType: params.settings.queryInputType,
     documentInputType: params.settings.documentInputType,
     outputDimensionality: params.settings.outputDimensionality,
-    fallback: "none",
+    fallback: "none" as const,
     local: params.settings.local,
   };
 }

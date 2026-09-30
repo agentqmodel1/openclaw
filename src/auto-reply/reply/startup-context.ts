@@ -1,8 +1,13 @@
+// Loads startup context snippets injected into the first reply turn.
 import fs from "node:fs";
 import path from "node:path";
-import { resolveUserTimezone } from "../../agents/date-time.js";
+import { promisify } from "node:util";
+import { resolveIntegerOption } from "@openclaw/normalization-core/number-coercion";
+import { uniqueStrings } from "@openclaw/normalization-core/string-normalization";
+import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
+import { formatDateStamp, resolveUserTimezone } from "../../agents/date-time.js";
 import type { OpenClawConfig } from "../../config/config.js";
-import { openBoundaryFile } from "../../infra/boundary-file-read.js";
+import { openRootFile, readFileDescriptorBounded } from "../../infra/boundary-file-read.js";
 
 const STARTUP_MEMORY_FILE_MAX_BYTES = 16_384;
 const STARTUP_MEMORY_FILE_MAX_CHARS = 1_200;
@@ -31,52 +36,28 @@ export function shouldApplyStartupContext(params: {
 
 function resolveStartupContextLimits(cfg?: OpenClawConfig) {
   const startupContext = cfg?.agents?.defaults?.startupContext;
-  const clampInt = (value: number | undefined, fallback: number, min: number, max: number) => {
-    const numeric = Number.isFinite(value) ? Math.trunc(value as number) : fallback;
-    return Math.min(max, Math.max(min, numeric));
-  };
   return {
-    dailyMemoryDays: clampInt(
+    dailyMemoryDays: resolveIntegerOption(
       startupContext?.dailyMemoryDays,
       STARTUP_MEMORY_DAILY_DAYS,
-      1,
-      STARTUP_MEMORY_DAILY_DAYS_CAP,
+      { min: 1, max: STARTUP_MEMORY_DAILY_DAYS_CAP },
     ),
-    maxFileBytes: clampInt(
+    maxFileBytes: resolveIntegerOption(
       startupContext?.maxFileBytes,
       STARTUP_MEMORY_FILE_MAX_BYTES,
-      1,
-      STARTUP_MEMORY_FILE_MAX_BYTES_CAP,
+      { min: 1, max: STARTUP_MEMORY_FILE_MAX_BYTES_CAP },
     ),
-    maxFileChars: clampInt(
+    maxFileChars: resolveIntegerOption(
       startupContext?.maxFileChars,
       STARTUP_MEMORY_FILE_MAX_CHARS,
-      1,
-      STARTUP_MEMORY_FILE_MAX_CHARS_CAP,
+      { min: 1, max: STARTUP_MEMORY_FILE_MAX_CHARS_CAP },
     ),
-    maxTotalChars: clampInt(
+    maxTotalChars: resolveIntegerOption(
       startupContext?.maxTotalChars,
       STARTUP_MEMORY_TOTAL_MAX_CHARS,
-      1,
-      STARTUP_MEMORY_TOTAL_MAX_CHARS_CAP,
+      { min: 1, max: STARTUP_MEMORY_TOTAL_MAX_CHARS_CAP },
     ),
   };
-}
-
-function formatDateStamp(nowMs: number, timezone: string): string {
-  const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone: timezone,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).formatToParts(new Date(nowMs));
-  const year = parts.find((part) => part.type === "year")?.value;
-  const month = parts.find((part) => part.type === "month")?.value;
-  const day = parts.find((part) => part.type === "day")?.value;
-  if (year && month && day) {
-    return `${year}-${month}-${day}`;
-  }
-  return new Date(nowMs).toISOString().slice(0, 10);
 }
 
 function shiftDateStampByCalendarDays(stamp: string, offsetDays: number): string {
@@ -115,11 +96,7 @@ function trimStartupMemoryContent(content: string, maxChars: number): string {
   if (trimmed.length <= maxChars) {
     return trimmed;
   }
-  return `${trimmed.slice(0, maxChars)}\n...[truncated]...`;
-}
-
-function escapeQuotedStartupMemory(content: string): string {
-  return content.replaceAll("```", "\\`\\`\\`");
+  return `${truncateUtf16Safe(trimmed, maxChars)}\n...[truncated]...`;
 }
 
 function sanitizeStartupMemoryLabel(value: string): string {
@@ -135,7 +112,7 @@ function formatStartupMemoryBlock(relativePath: string, content: string): string
     `[Untrusted daily memory: ${sanitizeStartupMemoryLabel(relativePath)}]`,
     "BEGIN_QUOTED_NOTES",
     "```text",
-    escapeQuotedStartupMemory(content),
+    content.replaceAll("```", "\\`\\`\\`"),
     "```",
     "END_QUOTED_NOTES",
   ].join("\n");
@@ -173,39 +150,13 @@ function fitStartupMemoryBlock(params: {
   return best;
 }
 
-async function readFromFd(params: { fd: number; maxFileBytes: number }): Promise<string> {
-  const buf = Buffer.alloc(params.maxFileBytes);
-  const bytesRead = await new Promise<number>((resolve, reject) => {
-    fs.read(params.fd, buf, 0, params.maxFileBytes, 0, (error, read) => {
-      if (error) {
-        reject(error);
-        return;
-      }
-      resolve(read);
-    });
-  });
-  return buf.subarray(0, bytesRead).toString("utf-8");
-}
-
-async function closeFd(fd: number): Promise<void> {
-  await new Promise<void>((resolve, reject) => {
-    fs.close(fd, (error) => {
-      if (error) {
-        reject(error);
-        return;
-      }
-      resolve();
-    });
-  });
-}
-
 async function readStartupMemoryFile(params: {
   workspaceDir: string;
   relativePath: string;
   maxFileBytes: number;
 }): Promise<string | null> {
   const absolutePath = path.join(params.workspaceDir, params.relativePath);
-  const opened = await openBoundaryFile({
+  const opened = await openRootFile({
     absolutePath,
     rootPath: params.workspaceDir,
     boundaryLabel: "workspace root",
@@ -215,9 +166,9 @@ async function readStartupMemoryFile(params: {
     return null;
   }
   try {
-    return await readFromFd({ fd: opened.fd, maxFileBytes: params.maxFileBytes });
+    return (await readFileDescriptorBounded(opened.fd, params.maxFileBytes)).toString("utf-8");
   } finally {
-    await closeFd(opened.fd);
+    await promisify(fs.close)(opened.fd);
   }
 }
 
@@ -226,68 +177,48 @@ async function listStartupMemoryPathsByDate(params: {
   stamps: string[];
 }): Promise<Map<string, string[]>> {
   const memoryDir = path.join(params.workspaceDir, "memory");
-  const uniqueStamps = Array.from(new Set(params.stamps));
+  const uniqueStamps = uniqueStrings(params.stamps);
   const fallback = new Map(uniqueStamps.map((stamp) => [stamp, [`${stamp}.md`]]));
   const stampSet = new Set(uniqueStamps);
 
   try {
     const entries = await fs.promises.readdir(memoryDir, { withFileTypes: true });
-    const sluggedNamesByStamp = new Map<string, string[]>();
-
-    for (const entry of entries) {
-      if (!entry.isFile() || !entry.name.endsWith(".md")) {
-        continue;
-      }
+    const sluggedNames = entries.flatMap((entry) => {
       const stamp = entry.name.slice(0, 10);
-      if (!stampSet.has(stamp)) {
-        continue;
+      if (
+        !entry.isFile() ||
+        !entry.name.endsWith(".md") ||
+        !stampSet.has(stamp) ||
+        !entry.name.startsWith(`${stamp}-`)
+      ) {
+        return [];
       }
-      if (entry.name === `${stamp}.md`) {
-        continue;
-      }
-      if (!entry.name.startsWith(`${stamp}-`)) {
-        continue;
-      }
-      const names = sluggedNamesByStamp.get(stamp);
-      if (names) {
-        names.push(entry.name);
-      } else {
-        sluggedNamesByStamp.set(stamp, [entry.name]);
-      }
-    }
+      return [{ stamp, name: entry.name }];
+    });
 
     const sluggedNameResults = await Promise.allSettled(
-      Array.from(sluggedNamesByStamp.entries()).flatMap(([stamp, names]) =>
-        names.map(async (name) => ({
-          stamp,
-          name,
-          stat: await fs.promises.stat(path.join(memoryDir, name)),
-        })),
-      ),
+      sluggedNames.map(async ({ stamp, name }) => ({
+        stamp,
+        name,
+        stat: await fs.promises.stat(path.join(memoryDir, name)),
+      })),
     );
-    const sluggedStatsByStamp = new Map<
-      string,
-      Array<{ name: string; stat: Awaited<ReturnType<typeof fs.promises.stat>> }>
-    >();
+    const sluggedStatsByStamp = new Map<string, Array<{ name: string; stat: fs.Stats }>>();
     for (const result of sluggedNameResults) {
       if (result.status !== "fulfilled") {
         continue;
       }
-      const existing = sluggedStatsByStamp.get(result.value.stamp);
-      if (existing) {
-        existing.push({ name: result.value.name, stat: result.value.stat });
-      } else {
-        sluggedStatsByStamp.set(result.value.stamp, [
-          { name: result.value.name, stat: result.value.stat },
-        ]);
-      }
+      const { stamp, name, stat } = result.value;
+      const stampEntries = sluggedStatsByStamp.get(stamp) ?? [];
+      stampEntries.push({ name, stat });
+      sluggedStatsByStamp.set(stamp, stampEntries);
     }
 
     return new Map(
       uniqueStamps.map((stamp) => {
         const newestSluggedNames = (sluggedStatsByStamp.get(stamp) ?? [])
           .toSorted((left, right) => {
-            const mtimeDiff = Number(right.stat.mtimeMs) - Number(left.stat.mtimeMs);
+            const mtimeDiff = right.stat.mtimeMs - left.stat.mtimeMs;
             if (mtimeDiff !== 0) {
               return mtimeDiff;
             }
@@ -364,10 +295,6 @@ export async function buildSessionStartupContextPrelude(params: {
       if (sections.length > 0) {
         sections.push("...[additional startup memory truncated]...");
       }
-      break;
-    }
-    if (sections.length > 0 && totalChars + block.length > limits.maxTotalChars) {
-      sections.push("...[additional startup memory truncated]...");
       break;
     }
     sections.push(block);

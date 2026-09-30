@@ -1,66 +1,48 @@
+// Module loader tests cover channel plugin module resolution and import failure handling.
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { importFreshModule } from "openclaw/plugin-sdk/test-fixtures";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { shouldExpectNativeJitiForJavaScriptTestRuntime } from "../../test-utils/jiti-runtime.js";
-import {
-  isJavaScriptModulePath,
-  resolveCompiledBundledModulePath,
-  resolveExistingPluginModulePath,
-  resolvePluginModuleCandidates,
-} from "./module-loader.js";
+import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
+import { isJavaScriptModulePath } from "../../plugins/native-module-require.js";
+import { loadChannelPluginModule, resolveExistingPluginModulePath } from "./module-loader.js";
 
-const tempDirs: string[] = [];
+const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 
 afterEach(() => {
-  for (const tempDir of tempDirs.splice(0)) {
-    fs.rmSync(tempDir, { recursive: true, force: true });
-  }
+  vi.restoreAllMocks();
   vi.resetModules();
   vi.doUnmock("jiti");
 });
 
-function createTempDir(): string {
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-channel-module-loader-"));
-  tempDirs.push(tempDir);
-  return tempDir;
-}
-
 describe("channel plugin module loader helpers", () => {
-  it("prefers compiled bundled dist output when present", () => {
-    const rootDir = createTempDir();
-    const runtimePath = path.join(rootDir, "dist-runtime", "entry.js");
-    const compiledPath = path.join(rootDir, "dist", "entry.js");
-    fs.mkdirSync(path.dirname(compiledPath), { recursive: true });
-    fs.writeFileSync(compiledPath, "export {};\n", "utf8");
+  it.each(["mts", "mtsx", "ctsx"])(
+    "resolves extensionless plugin module specifiers to %s",
+    (extension) => {
+      const rootDir = tempDirs.make("openclaw-channel-module-loader-");
+      const expectedPath = path.join(rootDir, "src", `checker.${extension}`);
+      fs.mkdirSync(path.dirname(expectedPath), { recursive: true });
+      fs.writeFileSync(expectedPath, "export const ok = true;\n", "utf8");
 
-    expect(resolveCompiledBundledModulePath(runtimePath)).toBe(compiledPath);
+      expect(resolveExistingPluginModulePath(rootDir, "./src/checker")).toBe(expectedPath);
+    },
+  );
+
+  it("preserves explicit JavaScript plugin module specifiers", () => {
+    const rootDir = tempDirs.make("openclaw-channel-module-loader-");
+    const expectedPath = path.join(rootDir, "checker.js");
+    fs.writeFileSync(expectedPath, "export const ok = true;\n", "utf8");
+
+    expect(resolveExistingPluginModulePath(rootDir, "./checker.js")).toBe(expectedPath);
   });
 
-  it("keeps dist-runtime path when compiled bundled output is absent", () => {
-    const rootDir = createTempDir();
-    const runtimePath = path.join(rootDir, "dist-runtime", "entry.js");
-
-    expect(resolveCompiledBundledModulePath(runtimePath)).toBe(runtimePath);
-  });
-
-  it("resolves plugin module candidates and picks the first existing extension", () => {
-    const rootDir = createTempDir();
-    const expectedPath = path.join(rootDir, "src", "checker.mts");
+  it("resolves plugin module directories through their index", () => {
+    const rootDir = tempDirs.make("openclaw-channel-module-loader-");
+    const expectedPath = path.join(rootDir, "checker", "index.js");
     fs.mkdirSync(path.dirname(expectedPath), { recursive: true });
     fs.writeFileSync(expectedPath, "export const ok = true;\n", "utf8");
 
-    expect(resolvePluginModuleCandidates(rootDir, "./src/checker")).toEqual([
-      path.join(rootDir, "src", "checker"),
-      path.join(rootDir, "src", "checker.ts"),
-      path.join(rootDir, "src", "checker.mts"),
-      path.join(rootDir, "src", "checker.js"),
-      path.join(rootDir, "src", "checker.mjs"),
-      path.join(rootDir, "src", "checker.cts"),
-      path.join(rootDir, "src", "checker.cjs"),
-    ]);
-    expect(resolveExistingPluginModulePath(rootDir, "./src/checker")).toBe(expectedPath);
+    expect(resolveExistingPluginModulePath(rootDir, "./checker")).toBe(expectedPath);
   });
 
   it("detects JavaScript module paths case-insensitively", () => {
@@ -69,9 +51,36 @@ describe("channel plugin module loader helpers", () => {
     expect(isJavaScriptModulePath("/tmp/entry.ts")).toBe(false);
   });
 
-  it("uses native require for eligible JavaScript modules before falling back to Jiti", async () => {
+  it("reports a missing plugin module as not found instead of a boundary escape", () => {
+    const rootDir = tempDirs.make("openclaw-channel-module-loader-");
+    const modulePath = path.join(rootDir, "dist", "extensions", "demo", "auth-presence.js");
+
+    let thrown: unknown;
+    try {
+      loadChannelPluginModule({ modulePath, rootDir });
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(Error);
+    expect((thrown as Error).message).toBe(`plugin module path not found: ${modulePath}`);
+    expect((thrown as Error).message).not.toContain("escapes");
+    expect(((thrown as Error).cause as NodeJS.ErrnoException | undefined)?.code).toBe("ENOENT");
+  });
+
+  it("still reports a module outside the plugin root as a boundary escape", () => {
+    const rootDir = tempDirs.make("openclaw-channel-module-loader-");
+    const outsideDir = tempDirs.make("openclaw-channel-module-loader-");
+    const modulePath = path.join(outsideDir, "evil.cjs");
+    fs.writeFileSync(modulePath, "module.exports = { ok: true };\n", "utf8");
+
+    expect(() => loadChannelPluginModule({ modulePath, rootDir })).toThrow(
+      `plugin module path escapes plugin root or fails alias checks: ${modulePath}`,
+    );
+  });
+
+  it("uses native require for eligible JavaScript modules without creating Jiti", async () => {
     const createJiti = vi.fn(() => vi.fn(() => ({ ok: false })));
-    vi.resetModules();
     vi.doMock("jiti", () => ({
       createJiti,
     }));
@@ -79,7 +88,7 @@ describe("channel plugin module loader helpers", () => {
       import.meta.url,
       "./module-loader.js?scope=native-require",
     );
-    const rootDir = createTempDir();
+    const rootDir = tempDirs.make("openclaw-channel-module-loader-");
     const modulePath = path.join(rootDir, "dist", "extensions", "demo", "index.cjs");
     fs.mkdirSync(path.dirname(modulePath), { recursive: true });
     fs.writeFileSync(modulePath, "module.exports = { ok: true };\n", "utf8");
@@ -88,45 +97,24 @@ describe("channel plugin module loader helpers", () => {
       loaderModule.loadChannelPluginModule({
         modulePath,
         rootDir,
-        shouldTryNativeRequire: () => true,
       }),
     ).toEqual({ ok: true });
     expect(createJiti).not.toHaveBeenCalled();
   });
 
-  it("creates the runtime-supported Jiti boundary for Windows dist loads", async () => {
-    const createJiti = vi.fn(() => vi.fn(() => ({ ok: true })));
-    vi.resetModules();
-    vi.doMock("jiti", () => ({
-      createJiti,
-    }));
-    const platformSpy = vi.spyOn(process, "platform", "get").mockReturnValue("win32");
-
-    try {
-      const loaderModule = await importFreshModule<typeof import("./module-loader.js")>(
-        import.meta.url,
-        "./module-loader.js?scope=windows-dist-jiti",
-      );
-      const rootDir = createTempDir();
-      const modulePath = path.join(rootDir, "dist", "extensions", "demo", "index.js");
-      fs.mkdirSync(path.dirname(modulePath), { recursive: true });
-      fs.writeFileSync(modulePath, "export const ok = true;\n", "utf8");
-
-      const loaded = loaderModule.loadChannelPluginModule({
+  it.each(["ts", "tsx", "mts", "cts", "mtsx", "ctsx"])(
+    "loads typed %s channel modules with JavaScript sibling specifiers",
+    (extension) => {
+      const rootDir = tempDirs.make("openclaw-channel-module-loader-");
+      const modulePath = path.join(rootDir, `index.${extension}`);
+      fs.writeFileSync(path.join(rootDir, "value.ts"), 'export const value = "loaded";\n', "utf8");
+      fs.writeFileSync(
         modulePath,
-        rootDir,
-        shouldTryNativeRequire: () => false,
-      });
-
-      expect(loaded).toMatchObject({ ok: true });
-      expect(createJiti).toHaveBeenCalledWith(
-        expect.any(String),
-        expect.objectContaining({
-          tryNative: shouldExpectNativeJitiForJavaScriptTestRuntime(),
-        }),
+        'import { value } from "./value.js";\nexport const result: string = value;\n',
+        "utf8",
       );
-    } finally {
-      platformSpy.mockRestore();
-    }
-  });
+
+      expect(loadChannelPluginModule({ modulePath, rootDir })).toMatchObject({ result: "loaded" });
+    },
+  );
 });

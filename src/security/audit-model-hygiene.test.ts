@@ -1,3 +1,4 @@
+// Covers model hygiene audit findings and provider routing risks.
 import { describe, expect, it } from "vitest";
 import type { OpenClawConfig } from "../config/config.js";
 import { collectModelHygieneFindings } from "./audit-extra.sync.js";
@@ -31,6 +32,27 @@ describe("security audit model hygiene findings", () => {
         },
         expectedAbsentCheckId: "models.weak_tier",
       },
+      {
+        name: "gpt-6 generation",
+        cfg: {
+          agents: { defaults: { model: { primary: "github-copilot/gpt-6-astra" } } },
+        },
+        expectedAbsentCheckId: "models.weak_tier",
+      },
+      {
+        name: "gpt-4.1 stays below threshold",
+        cfg: {
+          agents: { defaults: { model: { primary: "openai/gpt-4.1" } } },
+        },
+        expectedPresent: [{ checkId: "models.weak_tier", severity: "warn" }],
+      },
+      {
+        name: "azure gpt-35-turbo alias stays below threshold",
+        cfg: {
+          agents: { defaults: { model: { primary: "azure-openai/gpt-35-turbo" } } },
+        },
+        expectedPresent: [{ checkId: "models.weak_tier", severity: "warn" }],
+      },
     ];
 
     for (const testCase of cases) {
@@ -62,14 +84,14 @@ describe("security audit model hygiene findings", () => {
             fallbacks: ["gpt-prev", "gpt-mini"],
           },
           models: {
-            "openai-codex/gpt-5.5": { alias: "gpt" },
-            "openai-codex/gpt-5.4": { alias: "gpt-prev" },
+            "openai/gpt-5.5": { alias: "gpt" },
+            "openai/gpt-5.4": { alias: "gpt-prev" },
             "openai/gpt-5-mini": { alias: "gpt-mini" },
           },
         },
       },
     } satisfies OpenClawConfig);
 
-    expect(findings.some((finding) => finding.checkId === "models.weak_tier")).toBe(false);
+    expect(findings.map((finding) => finding.checkId)).not.toContain("models.weak_tier");
   });
 });

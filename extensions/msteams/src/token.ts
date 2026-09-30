@@ -1,18 +1,15 @@
-import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
-import { dirname } from "node:path";
-import type { MSTeamsConfig } from "../runtime-api.js";
-import type { MSTeamsDelegatedTokens } from "./oauth.shared.js";
-import { refreshMSTeamsDelegatedTokens } from "./oauth.token.js";
+import { isFutureDateTimestampMs } from "openclaw/plugin-sdk/number-runtime";
 import {
   hasConfiguredSecretInput,
   normalizeResolvedSecretInputString,
   normalizeSecretInputString,
-} from "./secret-input.js";
-import { resolveMSTeamsStorePath } from "./storage.js";
+} from "openclaw/plugin-sdk/secret-input";
+import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
+import type { MSTeamsConfig } from "../runtime-api.js";
+import { loadMSTeamsDelegatedTokens, saveMSTeamsDelegatedTokens } from "./delegated-state.js";
+import { refreshMSTeamsDelegatedTokens } from "./oauth.token.js";
 
-// ── Credential types ───────────────────────────────────────────────────────
-
-export type MSTeamsSecretCredentials = {
+type MSTeamsSecretCredentials = {
   type: "secret";
   appId: string;
   appPassword: string;
@@ -31,8 +28,6 @@ export type MSTeamsFederatedCredentials = {
 
 export type MSTeamsCredentials = MSTeamsSecretCredentials | MSTeamsFederatedCredentials;
 
-// ── Helpers ────────────────────────────────────────────────────────────────
-
 function resolveAuthType(cfg?: MSTeamsConfig): "secret" | "federated" {
   const fromCfg = cfg?.authType;
   if (fromCfg === "secret" || fromCfg === "federated") {
@@ -47,7 +42,17 @@ function resolveAuthType(cfg?: MSTeamsConfig): "secret" | "federated" {
   return "secret";
 }
 
-// ── hasConfiguredMSTeamsCredentials ────────────────────────────────────────
+function resolveFederatedPath(configValue?: string, envValue?: string): string | undefined {
+  // Reject blank settings without trimming a real path: surrounding whitespace
+  // can be part of the certificate filename on the filesystem.
+  if (normalizeOptionalString(configValue)) {
+    return configValue;
+  }
+  if (normalizeOptionalString(envValue)) {
+    return envValue;
+  }
+  return undefined;
+}
 
 export function hasConfiguredMSTeamsCredentials(cfg?: MSTeamsConfig): boolean {
   const authType = resolveAuthType(cfg);
@@ -62,22 +67,21 @@ export function hasConfiguredMSTeamsCredentials(cfg?: MSTeamsConfig): boolean {
   );
 
   if (authType === "federated") {
-    const hasCert = Boolean(cfg?.certificatePath || process.env.MSTEAMS_CERTIFICATE_PATH);
+    const hasCert = Boolean(
+      resolveFederatedPath(cfg?.certificatePath, process.env.MSTEAMS_CERTIFICATE_PATH),
+    );
     const hasManagedIdentity =
       cfg?.useManagedIdentity ?? process.env.MSTEAMS_USE_MANAGED_IDENTITY === "true";
 
     return hasAppId && hasTenantId && (hasCert || hasManagedIdentity);
   }
 
-  // "secret" (default) — original logic
   return Boolean(
     normalizeSecretInputString(cfg?.appId) &&
     hasConfiguredSecretInput(cfg?.appPassword) &&
     normalizeSecretInputString(cfg?.tenantId),
   );
 }
-
-// ── resolveMSTeamsCredentials ─────────────────────────────────────────────
 
 export function resolveMSTeamsCredentials(cfg?: MSTeamsConfig): MSTeamsCredentials | undefined {
   const authType = resolveAuthType(cfg);
@@ -95,8 +99,10 @@ export function resolveMSTeamsCredentials(cfg?: MSTeamsConfig): MSTeamsCredentia
   }
 
   if (authType === "federated") {
-    const certificatePath =
-      cfg?.certificatePath || process.env.MSTEAMS_CERTIFICATE_PATH || undefined;
+    const certificatePath = resolveFederatedPath(
+      cfg?.certificatePath,
+      process.env.MSTEAMS_CERTIFICATE_PATH,
+    );
 
     const certificateThumbprint =
       cfg?.certificateThumbprint || process.env.MSTEAMS_CERTIFICATE_THUMBPRINT || undefined;
@@ -123,7 +129,6 @@ export function resolveMSTeamsCredentials(cfg?: MSTeamsConfig): MSTeamsCredentia
     };
   }
 
-  // "secret" (default) — original logic
   const appPassword =
     normalizeResolvedSecretInputString({
       value: cfg?.appPassword,
@@ -137,48 +142,21 @@ export function resolveMSTeamsCredentials(cfg?: MSTeamsConfig): MSTeamsCredentia
   return { type: "secret", appId, appPassword, tenantId };
 }
 
-// ---------------------------------------------------------------------------
-// Delegated token storage / resolution
-// ---------------------------------------------------------------------------
-
-const DELEGATED_TOKEN_FILENAME = "msteams-delegated.json";
-
-export function resolveDelegatedTokenPath(): string {
-  return resolveMSTeamsStorePath({ filename: DELEGATED_TOKEN_FILENAME });
-}
-
-export function loadDelegatedTokens(): MSTeamsDelegatedTokens | undefined {
-  try {
-    const content = readFileSync(resolveDelegatedTokenPath(), "utf8");
-    return JSON.parse(content) as MSTeamsDelegatedTokens;
-  } catch {
-    return undefined;
-  }
-}
-
-export function saveDelegatedTokens(tokens: MSTeamsDelegatedTokens): void {
-  const tokenPath = resolveDelegatedTokenPath();
-  const dir = dirname(tokenPath);
-  mkdirSync(dir, { recursive: true });
-  writeFileSync(tokenPath, JSON.stringify(tokens, null, 2), "utf8");
-}
-
 export async function resolveDelegatedAccessToken(params: {
   tenantId: string;
   clientId: string;
   clientSecret: string;
 }): Promise<string | undefined> {
-  const tokens = loadDelegatedTokens();
+  const tokens = await loadMSTeamsDelegatedTokens();
   if (!tokens) {
     return undefined;
   }
 
   // Token still valid (5-min buffer already baked into expiresAt)
-  if (tokens.expiresAt > Date.now()) {
+  if (isFutureDateTimestampMs(tokens.expiresAt)) {
     return tokens.accessToken;
   }
 
-  // Attempt refresh
   try {
     const refreshed = await refreshMSTeamsDelegatedTokens({
       tenantId: params.tenantId,
@@ -187,7 +165,7 @@ export async function resolveDelegatedAccessToken(params: {
       refreshToken: tokens.refreshToken,
       scopes: tokens.scopes,
     });
-    saveDelegatedTokens(refreshed);
+    await saveMSTeamsDelegatedTokens(refreshed);
     return refreshed.accessToken;
   } catch {
     return undefined;

@@ -1,4 +1,5 @@
 import {
+  normalizeDiscordDisplaySlug,
   normalizeDiscordSlug,
   resolveDiscordChannelConfigWithFallback,
   type DiscordGuildEntryResolved,
@@ -16,10 +17,10 @@ export function resolveDiscordPreflightChannelContext(params: {
   threadParentName?: string;
 }) {
   const threadName = params.threadChannel?.name;
-  const configChannelName = params.threadParentName ?? params.channelName;
-  const configChannelSlug = configChannelName ? normalizeDiscordSlug(configChannelName) : "";
   const displayChannelName = threadName ?? params.channelName;
-  const displayChannelSlug = displayChannelName ? normalizeDiscordSlug(displayChannelName) : "";
+  const displayChannelSlug = displayChannelName
+    ? normalizeDiscordDisplaySlug(displayChannelName)
+    : "";
   const guildSlug =
     params.guildInfo?.slug || (params.guildName ? normalizeDiscordSlug(params.guildName) : "");
 
@@ -43,13 +44,9 @@ export function resolveDiscordPreflightChannelContext(params: {
 
   return {
     threadName,
-    configChannelName,
-    configChannelSlug,
     displayChannelName,
     displayChannelSlug,
     guildSlug,
-    threadChannelSlug,
-    threadParentSlug,
     channelConfig,
   };
 }

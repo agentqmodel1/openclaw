@@ -1,4 +1,5 @@
-import { createHash } from "node:crypto";
+import { resolveTimerTimeoutMs } from "openclaw/plugin-sdk/number-runtime";
+import { fingerprintTelegramBotToken } from "./token-fingerprint.js";
 
 const TELEGRAM_POLLING_LEASES_KEY = Symbol.for("openclaw.telegram.pollingLeases");
 const DEFAULT_TELEGRAM_POLLING_LEASE_WAIT_MS = 5_000;
@@ -14,7 +15,7 @@ type TelegramPollingLeaseEntry = {
 
 type TelegramPollingLeaseRegistry = Map<string, TelegramPollingLeaseEntry>;
 
-export type TelegramPollingLease = {
+type TelegramPollingLease = {
   tokenFingerprint: string;
   waitedForPrevious: boolean;
   replacedStoppingPrevious: boolean;
@@ -28,6 +29,12 @@ type AcquireTelegramPollingLeaseOpts = {
   waitMs?: number;
 };
 
+type ReleaseStoppedTelegramPollingLeaseOpts = {
+  token: string;
+  accountId: string;
+  waitMs?: number;
+};
+
 type WaitForPreviousResult = "released" | "timeout" | "aborted";
 
 function pollingLeaseRegistry(): TelegramPollingLeaseRegistry {
@@ -36,10 +43,6 @@ function pollingLeaseRegistry(): TelegramPollingLeaseRegistry {
   };
   proc[TELEGRAM_POLLING_LEASES_KEY] ??= new Map();
   return proc[TELEGRAM_POLLING_LEASES_KEY];
-}
-
-function tokenFingerprint(token: string): string {
-  return createHash("sha256").update(token).digest("hex").slice(0, 16);
 }
 
 function createDuplicatePollingError(params: {
@@ -62,12 +65,16 @@ async function waitForPreviousRelease(params: {
   if (params.signal?.aborted) {
     return "aborted";
   }
+  if (params.waitMs <= 0) {
+    return "timeout";
+  }
 
   let timer: ReturnType<typeof setTimeout> | undefined;
   let abortListener: (() => void) | undefined;
   try {
+    const waitMs = resolveTimerTimeoutMs(params.waitMs, DEFAULT_TELEGRAM_POLLING_LEASE_WAIT_MS, 0);
     const timeout = new Promise<"timeout">((resolve) => {
-      timer = setTimeout(() => resolve("timeout"), Math.max(0, params.waitMs));
+      timer = setTimeout(() => resolve("timeout"), waitMs);
       timer.unref?.();
     });
     const aborted = new Promise<"aborted">((resolve) => {
@@ -132,21 +139,15 @@ export async function acquireTelegramPollingLease(
   opts: AcquireTelegramPollingLeaseOpts,
 ): Promise<TelegramPollingLease> {
   const registry = pollingLeaseRegistry();
-  const fingerprint = tokenFingerprint(opts.token);
+  const fingerprint = fingerprintTelegramBotToken(opts.token);
   const waitMs = opts.waitMs ?? DEFAULT_TELEGRAM_POLLING_LEASE_WAIT_MS;
   let waitedForPrevious = false;
+  let replacedStoppingPrevious = false;
 
   for (;;) {
     const existing = registry.get(fingerprint);
     if (!existing) {
-      return createLease({
-        accountId: opts.accountId,
-        abortSignal: opts.abortSignal,
-        registry,
-        tokenFingerprint: fingerprint,
-        waitedForPrevious,
-        replacedStoppingPrevious: false,
-      });
+      break;
     }
 
     if (!existing.abortSignal?.aborted) {
@@ -177,17 +178,42 @@ export async function acquireTelegramPollingLease(
       continue;
     }
 
-    return createLease({
-      accountId: opts.accountId,
-      abortSignal: opts.abortSignal,
-      registry,
-      tokenFingerprint: fingerprint,
-      waitedForPrevious,
-      replacedStoppingPrevious: true,
-    });
+    replacedStoppingPrevious = true;
+    break;
   }
+  return createLease({
+    accountId: opts.accountId,
+    abortSignal: opts.abortSignal,
+    registry,
+    tokenFingerprint: fingerprint,
+    waitedForPrevious,
+    replacedStoppingPrevious,
+  });
 }
 
-export function resetTelegramPollingLeasesForTests(): void {
-  pollingLeaseRegistry().clear();
+export async function releaseStoppedTelegramPollingLease(
+  opts: ReleaseStoppedTelegramPollingLeaseOpts,
+): Promise<boolean> {
+  const registry = pollingLeaseRegistry();
+  const fingerprint = fingerprintTelegramBotToken(opts.token);
+  const existing = registry.get(fingerprint);
+  if (!existing || existing.accountId !== opts.accountId) {
+    return false;
+  }
+
+  if (!existing.abortSignal?.aborted) {
+    return false;
+  }
+
+  const waitResult = await waitForPreviousRelease({
+    done: existing.done,
+    waitMs: opts.waitMs ?? DEFAULT_TELEGRAM_POLLING_LEASE_WAIT_MS,
+  });
+  if (waitResult === "released" || registry.get(fingerprint) !== existing) {
+    return false;
+  }
+
+  registry.delete(fingerprint);
+  existing.resolveDone();
+  return true;
 }

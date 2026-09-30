@@ -1,13 +1,44 @@
 import { describeAccountSnapshot } from "openclaw/plugin-sdk/account-helpers";
-import { hasConfiguredSecretInput } from "openclaw/plugin-sdk/secret-input";
-import { patchChannelConfigForAccount } from "openclaw/plugin-sdk/setup-runtime";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
+import {
+  createSetupTranslator,
+  parseMentionOrPrefixedId,
+  patchChannelConfigForAccount,
+} from "openclaw/plugin-sdk/setup-runtime";
 import { formatDocsLink } from "openclaw/plugin-sdk/setup-tools";
+import { isSlackSetupAccountConfigured } from "./account-configured.js";
 import type { ResolvedSlackAccount } from "./accounts.js";
-import type { OpenClawConfig } from "./channel-api.js";
+import { DEFAULT_SLACK_SUGGESTED_PROMPTS } from "./channel-meta.js";
 
 export const SLACK_CHANNEL = "slack" as const;
 
-function buildSlackManifest(botName: string) {
+export function buildSlackAllowFromPrompt() {
+  const t = createSetupTranslator();
+  return {
+    helpTitle: t("wizard.slack.allowlistTitle"),
+    helpLines: [
+      t("wizard.slack.allowlistIntro"),
+      t("wizard.slack.examples"),
+      "- U12345678",
+      "- @alice",
+      t("wizard.slack.multipleEntries"),
+      t("wizard.channels.docs", { link: formatDocsLink("/slack", "slack") }),
+    ],
+    message: t("wizard.slack.allowFromPrompt"),
+    placeholder: "@alice, U12345678",
+    invalidWithoutCredentialNote: t("wizard.slack.allowFromInvalidWithoutToken"),
+    parseId: (value: string) =>
+      parseMentionOrPrefixedId({
+        value,
+        mentionPattern: /^<@([A-Z0-9]+)>$/i,
+        prefixPattern: /^(slack:|user:)/i,
+        idPattern: /^[A-Z][A-Z0-9]+$/i,
+        normalizeId: (id) => id.toUpperCase(),
+      }),
+  };
+}
+
+export function buildSlackManifest(botName = "OpenClaw") {
   const safeName = botName.trim() || "OpenClaw";
   const manifest = {
     display_information: {
@@ -20,8 +51,13 @@ function buildSlackManifest(botName: string) {
         always_online: true,
       },
       app_home: {
+        home_tab_enabled: true,
         messages_tab_enabled: true,
         messages_tab_read_only_enabled: false,
+      },
+      agent_view: {
+        agent_description: `${safeName} connects Slack Agent View conversations to OpenClaw agents.`,
+        suggested_prompts: DEFAULT_SLACK_SUGGESTED_PROMPTS,
       },
       slash_commands: [
         {
@@ -55,6 +91,7 @@ function buildSlackManifest(botName: string) {
           "pins:write",
           "reactions:read",
           "reactions:write",
+          "usergroups:read",
           "users:read",
         ],
       },
@@ -63,7 +100,11 @@ function buildSlackManifest(botName: string) {
       socket_mode_enabled: true,
       event_subscriptions: {
         bot_events: [
+          "app_home_opened",
           "app_mention",
+          "app_context_changed",
+          "agent_session_stopped",
+          "agent_session_title_changed",
           "channel_rename",
           "member_joined_channel",
           "member_left_channel",
@@ -82,18 +123,16 @@ function buildSlackManifest(botName: string) {
   return JSON.stringify(manifest, null, 2);
 }
 
-export function buildSlackSetupLines(botName = "OpenClaw"): string[] {
+export function buildSlackSetupLines(): string[] {
   return [
-    "1) Slack API -> Create App -> From scratch or From manifest (with the JSON below)",
-    "2) Add Socket Mode + enable it to get the app-level token (xapp-...)",
-    "3) Install App to workspace to get the xoxb- bot token",
-    "4) Enable Event Subscriptions (socket) for message events",
-    "5) App Home -> enable the Messages tab for DMs",
-    "Tip: set SLACK_BOT_TOKEN + SLACK_APP_TOKEN in your env.",
+    "1) Slack API -> Create App -> From scratch or a transport-specific manifest",
+    "2) Install App to workspace to get the xoxb- bot token",
+    "3) Socket Mode: enable it and create an app-level token (xapp-...)",
+    "4) HTTP: configure a public HTTPS Request URL and copy the app Signing Secret",
+    "5) Enable Event Subscriptions for message, App Home, and Agent View events",
+    "6) App Home -> enable the Home tab, Messages tab for DMs, and Agent View",
+    "Tip: Socket Mode can use SLACK_BOT_TOKEN + SLACK_APP_TOKEN in your env.",
     `Docs: ${formatDocsLink("/slack", "slack")}`,
-    "",
-    "Manifest (JSON):",
-    buildSlackManifest(botName),
   ];
 }
 
@@ -111,14 +150,6 @@ export function setSlackChannelAllowlist(
   });
 }
 
-export function isSlackSetupAccountConfigured(account: ResolvedSlackAccount): boolean {
-  const hasConfiguredBotToken =
-    Boolean(account.botToken?.trim()) || hasConfiguredSecretInput(account.config.botToken);
-  const hasConfiguredAppToken =
-    Boolean(account.appToken?.trim()) || hasConfiguredSecretInput(account.config.appToken);
-  return hasConfiguredBotToken && hasConfiguredAppToken;
-}
-
 export function describeSlackSetupAccount(account: ResolvedSlackAccount) {
   return describeAccountSnapshot({
     account,
@@ -126,6 +157,9 @@ export function describeSlackSetupAccount(account: ResolvedSlackAccount) {
     extra: {
       botTokenSource: account.botTokenSource,
       appTokenSource: account.appTokenSource,
+      ...(account.identity === "user"
+        ? { identity: account.identity, userTokenSource: account.userTokenSource }
+        : {}),
     },
   });
 }

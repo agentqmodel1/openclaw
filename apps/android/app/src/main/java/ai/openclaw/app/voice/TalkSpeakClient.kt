@@ -1,15 +1,15 @@
 package ai.openclaw.app.voice
 
 import ai.openclaw.app.gateway.GatewaySession
+import kotlinx.coroutines.CancellationException
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 
+/** Decoded talk.speak audio bytes plus provider metadata needed for Android playback. */
 internal data class TalkSpeakAudio(
   val bytes: ByteArray,
-  val provider: String,
   val outputFormat: String?,
-  val voiceCompatible: Boolean?,
   val mimeType: String?,
   val fileExtension: String?,
 )
@@ -19,21 +19,31 @@ internal sealed interface TalkSpeakResult {
     val audio: TalkSpeakAudio,
   ) : TalkSpeakResult
 
+  /** Provider or config absence allows Android local TTS to handle the reply. */
   data class FallbackToLocal(
     val message: String,
   ) : TalkSpeakResult
 
+  /** Request, payload, or audio errors that should stay visible to the caller. */
   data class Failure(
     val message: String,
   ) : TalkSpeakResult
 }
 
+internal interface TalkSpeechSynthesizing {
+  suspend fun synthesize(
+    text: String,
+    directive: TalkDirective?,
+  ): TalkSpeakResult
+}
+
+/** Gateway RPC client for talk.speak with local-TTS fallback classification. */
 internal class TalkSpeakClient(
   private val session: GatewaySession? = null,
   private val json: Json = Json { ignoreUnknownKeys = true },
   private val requestDetailed: (suspend (String, String, Long) -> GatewaySession.RpcResult)? = null,
-) {
-  suspend fun synthesize(
+) : TalkSpeechSynthesizing {
+  override suspend fun synthesize(
     text: String,
     directive: TalkDirective?,
   ): TalkSpeakResult {
@@ -44,6 +54,8 @@ internal class TalkSpeakClient(
           paramsJson = json.encodeToString(TalkSpeakRequest.from(text = text, directive = directive)),
           timeoutMs = 45_000,
         )
+      } catch (err: CancellationException) {
+        throw err
       } catch (err: Throwable) {
         return TalkSpeakResult.Failure(err.message ?: "talk.speak request failed")
       }
@@ -74,9 +86,7 @@ internal class TalkSpeakClient(
     return TalkSpeakResult.Success(
       TalkSpeakAudio(
         bytes = bytes,
-        provider = payload.provider,
         outputFormat = payload.outputFormat,
-        voiceCompatible = payload.voiceCompatible,
         mimeType = payload.mimeType,
         fileExtension = payload.fileExtension,
       ),
@@ -86,6 +96,8 @@ internal class TalkSpeakClient(
   private fun isFallbackEligible(error: GatewaySession.ErrorShape?): Boolean {
     val reason = error?.details?.reason
     if (reason == null) return true
+    // Only provider/config absence should fall back to Android TTS; payload and
+    // transport errors should stay visible to the caller.
     return reason == "talk_unconfigured" ||
       reason == "talk_provider_unsupported" ||
       reason == "method_unavailable"

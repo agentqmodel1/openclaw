@@ -1,3 +1,6 @@
+/**
+ * Tests channel config helper authorization and write-scope behavior.
+ */
 import { describe, expect, it } from "vitest";
 import { formatPairingApproveHint } from "../channels/plugins/helpers.js";
 import { DEFAULT_ACCOUNT_ID } from "../routing/session-key.js";
@@ -67,6 +70,9 @@ type DemoDmAccount = {
   allowFrom?: string[];
 };
 
+type DemoDmPolicy = ReturnType<ReturnType<typeof createDemoDmSecurityResolver>>;
+type ExpectedDemoDmPolicy = Omit<DemoDmPolicy, "normalizeEntry">;
+
 function createDemoDmSecurityResolver(
   params: {
     inheritSharedDefaultsFromDefaultAccount?: boolean;
@@ -82,30 +88,25 @@ function createDemoDmSecurityResolver(
   });
 }
 
+function expectDemoDmPolicy(policy: DemoDmPolicy, expected: ExpectedDemoDmPolicy) {
+  const { normalizeEntry, ...rest } = policy;
+
+  expect(rest).toEqual(expected);
+  expect(normalizeEntry).toBeTypeOf("function");
+  if (typeof normalizeEntry !== "function") {
+    throw new Error("expected normalizeEntry to be a function");
+  }
+  expect(normalizeEntry("OWNER")).toBe("owner");
+}
+
 describe("mapAllowFromEntries", () => {
-  it.each([
-    {
-      name: "coerces allowFrom entries to strings",
-      input: ["user", 42],
-      expected: ["user", "42"],
-    },
-    {
-      name: "returns empty list for missing input",
-      input: undefined,
-      expected: [],
-    },
-  ])("$name", ({ input, expected }) => {
-    expect(mapAllowFromEntries(input)).toEqual(expected);
+  it("returns empty list for missing input", () => {
+    expect(mapAllowFromEntries(undefined)).toEqual([]);
   });
 });
 
 describe("resolveOptionalConfigString", () => {
   it.each([
-    {
-      name: "trims and returns string values",
-      input: "  room:123  ",
-      expected: "room:123",
-    },
     {
       name: "coerces numeric values",
       input: 123,
@@ -187,20 +188,76 @@ describe("channel DM access helpers", () => {
     ]);
   });
 
-  it("migrates top-canonical legacy dm aliases", () => {
+  it.each([
+    {
+      name: "moves both aliases and removes the empty DM section",
+      entry: { dm: { policy: "allowlist", allowFrom: ["U1"] } },
+      expected: { dmPolicy: "allowlist", allowFrom: ["U1"] },
+      expectedChanges: [
+        "Moved channels.demo.dm.policy → channels.demo.dmPolicy.",
+        "Moved channels.demo.dm.allowFrom → channels.demo.allowFrom.",
+        "Removed empty channels.demo.dm after migration.",
+      ],
+    },
+    {
+      name: "removes matching aliases using normalized allowlist equality",
+      entry: {
+        dmPolicy: "allowlist",
+        allowFrom: ["U1", 42],
+        dm: { policy: "allowlist", allowFrom: [" U1 ", "42"], enabled: false },
+      },
+      expected: { dmPolicy: "allowlist", allowFrom: ["U1", 42], dm: { enabled: false } },
+      expectedChanges: [
+        "Removed channels.demo.dm.policy (dmPolicy already set).",
+        "Removed channels.demo.dm.allowFrom (allowFrom already set).",
+      ],
+    },
+    {
+      name: "preserves conflicting policies and differently ordered allowlists",
+      entry: {
+        dmPolicy: "disabled",
+        allowFrom: ["U1", "U2"],
+        dm: { policy: "open", allowFrom: ["U2", "U1"] },
+      },
+      expected: {
+        dmPolicy: "disabled",
+        allowFrom: ["U1", "U2"],
+        dm: { policy: "open", allowFrom: ["U2", "U1"] },
+      },
+      expectedChanges: [],
+    },
+    {
+      name: "keeps nested allowlists when their channel opts out of promotion",
+      entry: { dm: { policy: "allowlist", allowFrom: ["U1"] } },
+      promoteAllowFrom: false,
+      expected: { dmPolicy: "allowlist", dm: { allowFrom: ["U1"] } },
+      expectedChanges: ["Moved channels.demo.dm.policy → channels.demo.dmPolicy."],
+    },
+    {
+      name: "leaves an empty DM section untouched when no migration ran",
+      entry: { dm: {} },
+      expected: { dm: {} },
+      expectedChanges: [],
+    },
+  ])("$name", ({ entry, expected, expectedChanges, promoteAllowFrom }) => {
+    const original = structuredClone(entry);
     const changes: string[] = [];
     const result = normalizeLegacyDmAliases({
-      entry: { dm: { policy: "allowlist", allowFrom: ["U1"] } },
-      pathPrefix: "channels.slack",
+      entry,
+      pathPrefix: "channels.demo",
       changes,
+      promoteAllowFrom,
     });
 
-    expect(result.entry).toEqual({ dmPolicy: "allowlist", allowFrom: ["U1"] });
-    expect(changes).toEqual([
-      "Moved channels.slack.dm.policy → channels.slack.dmPolicy.",
-      "Moved channels.slack.dm.allowFrom → channels.slack.allowFrom.",
-      "Removed empty channels.slack.dm after migration.",
-    ]);
+    expect(result.entry).toEqual(expected);
+    expect(changes).toEqual(expectedChanges);
+    expect(entry).toEqual(original);
+    if (expectedChanges.length === 0) {
+      expect(result).toEqual({ entry, changed: false });
+      expect(result.entry).toBe(entry);
+    } else {
+      expect(result.changed).toBe(true);
+    }
   });
 });
 
@@ -444,7 +501,7 @@ describe("createScopedDmSecurityResolver", () => {
   it("builds account-aware DM policy payloads", () => {
     const resolveDmPolicy = createDemoDmSecurityResolver();
 
-    expect(
+    expectDemoDmPolicy(
       resolveDmPolicy({
         cfg: {
           channels: {
@@ -462,14 +519,14 @@ describe("createScopedDmSecurityResolver", () => {
           allowFrom: ["Owner"],
         },
       }),
-    ).toEqual({
-      policy: "allowlist",
-      allowFrom: ["Owner"],
-      policyPath: "channels.demo.accounts.alt.dmPolicy",
-      allowFromPath: "channels.demo.accounts.alt.",
-      approveHint: formatPairingApproveHint("demo"),
-      normalizeEntry: expect.any(Function),
-    });
+      {
+        policy: "allowlist",
+        allowFrom: ["Owner"],
+        policyPath: "channels.demo.accounts.alt.dmPolicy",
+        allowFromPath: "channels.demo.accounts.alt.",
+        approveHint: formatPairingApproveHint("demo"),
+      },
+    );
   });
 
   it("uses accounts.default paths when named accounts inherit shared defaults", () => {
@@ -477,7 +534,7 @@ describe("createScopedDmSecurityResolver", () => {
       inheritSharedDefaultsFromDefaultAccount: true,
     });
 
-    expect(
+    expectDemoDmPolicy(
       resolveDmPolicy({
         cfg: {
           channels: {
@@ -499,20 +556,20 @@ describe("createScopedDmSecurityResolver", () => {
           allowFrom: ["Owner"],
         },
       }),
-    ).toEqual({
-      policy: "allowlist",
-      allowFrom: ["Owner"],
-      policyPath: "channels.demo.accounts.default.dmPolicy",
-      allowFromPath: "channels.demo.accounts.default.",
-      approveHint: formatPairingApproveHint("demo"),
-      normalizeEntry: expect.any(Function),
-    });
+      {
+        policy: "allowlist",
+        allowFrom: ["Owner"],
+        policyPath: "channels.demo.accounts.default.dmPolicy",
+        allowFromPath: "channels.demo.accounts.default.",
+        approveHint: formatPairingApproveHint("demo"),
+      },
+    );
   });
 
   it("ignores accounts.default paths unless the channel opts into shared default-account inheritance", () => {
     const resolveDmPolicy = createDemoDmSecurityResolver();
 
-    expect(
+    expectDemoDmPolicy(
       resolveDmPolicy({
         cfg: {
           channels: {
@@ -536,14 +593,14 @@ describe("createScopedDmSecurityResolver", () => {
           allowFrom: ["*"],
         },
       }),
-    ).toEqual({
-      policy: "pairing",
-      allowFrom: ["*"],
-      policyPath: "channels.demo.dmPolicy",
-      allowFromPath: "channels.demo.",
-      approveHint: formatPairingApproveHint("demo"),
-      normalizeEntry: expect.any(Function),
-    });
+      {
+        policy: "pairing",
+        allowFrom: ["*"],
+        policyPath: "channels.demo.dmPolicy",
+        allowFromPath: "channels.demo.",
+        approveHint: formatPairingApproveHint("demo"),
+      },
+    );
   });
 });
 

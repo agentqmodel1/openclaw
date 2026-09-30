@@ -1,19 +1,26 @@
+// Browser tests cover server.evaluate disabled does not block storage plugin behavior.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { getFreePort } from "./test-port.js";
 import { getBrowserTestFetch } from "./test-support/fetch.js";
+import "../test-support/browser-security.mock.js";
 
 let testPort = 0;
-let prevGatewayPort: string | undefined;
-let prevGatewayToken: string | undefined;
-let prevGatewayPassword: string | undefined;
 
-const pwMocks = vi.hoisted(() => ({
-  cookiesGetViaPlaywright: vi.fn(async () => ({
-    cookies: [{ name: "session", value: "abc123" }],
-  })),
-  storageGetViaPlaywright: vi.fn(async () => ({ values: { token: "value" } })),
-  evaluateViaPlaywright: vi.fn(async () => "ok"),
-}));
+const pwMocks = vi.hoisted(() => {
+  const closePlaywrightBrowserConnection = vi.fn(async (_opts?: { cdpUrl?: string }) => {});
+  return {
+    closePlaywrightBrowserConnection,
+    cookiesGetViaPlaywright: vi.fn(async () => ({
+      cookies: [{ name: "session", value: "abc123" }],
+    })),
+    storageGetViaPlaywright: vi.fn(async () => ({ values: { token: "value" } })),
+    evaluateViaPlaywright: vi.fn(async () => "ok"),
+    retirePlaywrightBrowserConnectionExact: vi.fn((opts: { cdpUrl: string }) => ({
+      retired: true,
+      close: async () => await closePlaywrightBrowserConnection(opts),
+    })),
+  };
+});
 
 const routeCtxMocks = vi.hoisted(() => {
   const profileCtx = {
@@ -35,8 +42,10 @@ const routeCtxMocks = vi.hoisted(() => {
   };
 });
 
-vi.mock("../config/config.js", async () => {
-  const actual = await vi.importActual<typeof import("../config/config.js")>("../config/config.js");
+vi.mock("openclaw/plugin-sdk/runtime-config-snapshot", async () => {
+  const actual = await vi.importActual<
+    typeof import("openclaw/plugin-sdk/runtime-config-snapshot")
+  >("openclaw/plugin-sdk/runtime-config-snapshot");
   const loadConfig = () => ({
     browser: {
       enabled: true,
@@ -56,6 +65,7 @@ vi.mock("../config/config.js", async () => {
 });
 
 vi.mock("./pw-ai-module.js", () => ({
+  getLoadedPwAiModule: () => pwMocks,
   getPwAiModule: vi.fn(async () => pwMocks),
 }));
 
@@ -73,12 +83,9 @@ const { startBrowserControlServerFromConfig, stopBrowserControlServer } =
 describe("browser control evaluate gating", () => {
   beforeEach(async () => {
     testPort = await getFreePort();
-    prevGatewayPort = process.env.OPENCLAW_GATEWAY_PORT;
-    process.env.OPENCLAW_GATEWAY_PORT = String(testPort - 2);
-    prevGatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN;
-    prevGatewayPassword = process.env.OPENCLAW_GATEWAY_PASSWORD;
-    delete process.env.OPENCLAW_GATEWAY_TOKEN;
-    delete process.env.OPENCLAW_GATEWAY_PASSWORD;
+    vi.stubEnv("OPENCLAW_GATEWAY_PORT", String(testPort - 2));
+    vi.stubEnv("OPENCLAW_GATEWAY_TOKEN", undefined);
+    vi.stubEnv("OPENCLAW_GATEWAY_PASSWORD", undefined);
 
     pwMocks.cookiesGetViaPlaywright.mockClear();
     pwMocks.storageGetViaPlaywright.mockClear();
@@ -89,21 +96,7 @@ describe("browser control evaluate gating", () => {
 
   afterEach(async () => {
     vi.restoreAllMocks();
-    if (prevGatewayPort === undefined) {
-      delete process.env.OPENCLAW_GATEWAY_PORT;
-    } else {
-      process.env.OPENCLAW_GATEWAY_PORT = prevGatewayPort;
-    }
-    if (prevGatewayToken === undefined) {
-      delete process.env.OPENCLAW_GATEWAY_TOKEN;
-    } else {
-      process.env.OPENCLAW_GATEWAY_TOKEN = prevGatewayToken;
-    }
-    if (prevGatewayPassword === undefined) {
-      delete process.env.OPENCLAW_GATEWAY_PASSWORD;
-    } else {
-      process.env.OPENCLAW_GATEWAY_PASSWORD = prevGatewayPassword;
-    }
+    vi.unstubAllEnvs();
 
     await stopBrowserControlServer();
   });

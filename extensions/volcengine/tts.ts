@@ -1,9 +1,9 @@
 import * as crypto from "node:crypto";
-import { fetchWithSsrFGuard } from "openclaw/plugin-sdk/ssrf-runtime";
+import { asOptionalRecord, isRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
 
 export type VolcengineTtsEncoding = "ogg_opus" | "mp3" | "pcm" | "wav";
 
-export type VolcengineTTSParams = {
+type VolcengineTTSParams = {
   text: string;
   apiKey?: string;
   appId?: string;
@@ -26,6 +26,7 @@ const DEFAULT_LEGACY_VOICE = "zh_female_xiaohe_uranus_bigtts";
 const DEFAULT_CLUSTER = "volcano_tts";
 const DEFAULT_SEED_TTS_RESOURCE_ID = "seed-tts-1.0";
 const DEFAULT_SEED_TTS_APP_KEY = "aGjiRDfUWi";
+const VOLCENGINE_TTS_RESPONSE_MAX_BYTES = 16 * 1024 * 1024;
 const BYTEPLUS_SEED_TTS_URL =
   "https://voice.ap-southeast-1.bytepluses.com/api/v3/tts/unidirectional";
 const VOLCENGINE_LEGACY_TTS_URL = "https://openspeech.bytedance.com/api/v1/tts";
@@ -39,10 +40,10 @@ type VolcengineTtsResponse = {
 function parseJsonObject(text: string, providerName: string): Record<string, unknown> {
   try {
     const parsed = JSON.parse(text) as unknown;
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    if (!isRecord(parsed)) {
       throw new Error("expected JSON object");
     }
-    return parsed as Record<string, unknown>;
+    return parsed;
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err);
     throw new Error(`${providerName} TTS: failed to parse response JSON: ${detail}`, {
@@ -52,10 +53,7 @@ function parseJsonObject(text: string, providerName: string): Record<string, unk
 }
 
 function toTtsResponse(parsed: Record<string, unknown>): VolcengineTtsResponse {
-  const header =
-    parsed.header && typeof parsed.header === "object" && !Array.isArray(parsed.header)
-      ? (parsed.header as Record<string, unknown>)
-      : undefined;
+  const header = asOptionalRecord(parsed.header);
   return {
     code:
       typeof parsed.code === "number"
@@ -71,10 +69,6 @@ function toTtsResponse(parsed: Record<string, unknown>): VolcengineTtsResponse {
           : undefined,
     data: typeof parsed.data === "string" ? parsed.data : undefined,
   };
-}
-
-function parseLegacyTtsResponse(text: string): VolcengineTtsResponse {
-  return toTtsResponse(parseJsonObject(text, "Volcengine"));
 }
 
 function parseSeedTtsFrames(text: string): VolcengineTtsResponse[] {
@@ -101,14 +95,6 @@ function parseSeedTtsFrames(text: string): VolcengineTtsResponse[] {
   return frames;
 }
 
-function hostnameAllowlist(url: string): string[] {
-  return [new URL(url).hostname];
-}
-
-function seedAudioFormat(encoding: VolcengineTtsEncoding): "ogg_opus" | "mp3" | "pcm" {
-  return encoding === "wav" ? "pcm" : encoding;
-}
-
 async function seedSpeechTTS(params: VolcengineTTSParams & { apiKey: string }): Promise<Buffer> {
   const {
     text,
@@ -117,12 +103,15 @@ async function seedSpeechTTS(params: VolcengineTTSParams & { apiKey: string }): 
     resourceId = DEFAULT_SEED_TTS_RESOURCE_ID,
     appKey = DEFAULT_SEED_TTS_APP_KEY,
     baseUrl = BYTEPLUS_SEED_TTS_URL,
-    speedRatio = 1.0,
+    speedRatio = 1,
     emotion,
     encoding = "ogg_opus",
     timeoutMs = 30_000,
   } = params;
-  const audioFormat = seedAudioFormat(encoding);
+  const audioFormat = encoding === "wav" ? "pcm" : encoding;
+  const { canonicalizeBase64 } = await import("openclaw/plugin-sdk/media-runtime");
+  const { readResponseWithLimit } = await import("openclaw/plugin-sdk/response-limit-runtime");
+  const { fetchWithSsrFGuard } = await import("openclaw/plugin-sdk/ssrf-runtime");
 
   const payload = JSON.stringify({
     user: { uid: "openclaw" },
@@ -133,7 +122,7 @@ async function seedSpeechTTS(params: VolcengineTTSParams & { apiKey: string }): 
         format: audioFormat,
         sample_rate: 24_000,
       },
-      ...(speedRatio !== 1.0 ? { speed_ratio: speedRatio } : {}),
+      ...(speedRatio !== 1 ? { speed_ratio: speedRatio } : {}),
       ...(emotion ? { emotion } : {}),
     },
   });
@@ -152,17 +141,27 @@ async function seedSpeechTTS(params: VolcengineTTSParams & { apiKey: string }): 
       body: payload,
     },
     timeoutMs,
-    policy: { hostnameAllowlist: hostnameAllowlist(baseUrl) },
+    policy: { hostnameAllowlist: [new URL(baseUrl).hostname] },
     auditContext: "volcengine.tts",
   });
 
   try {
-    const frames = parseSeedTtsFrames(await response.text());
+    const responseText = new TextDecoder("utf-8", { fatal: true }).decode(
+      await readResponseWithLimit(response, VOLCENGINE_TTS_RESPONSE_MAX_BYTES, {
+        onOverflow: ({ maxBytes }) =>
+          new Error(`BytePlus Seed Speech TTS response exceeds ${maxBytes} bytes`),
+      }),
+    );
+    const frames = parseSeedTtsFrames(responseText);
     const chunks: Buffer[] = [];
     for (const frame of frames) {
       if (frame.code === 0) {
         if (frame.data) {
-          chunks.push(Buffer.from(frame.data, "base64"));
+          const canonicalAudio = canonicalizeBase64(frame.data);
+          if (!canonicalAudio) {
+            throw new Error("BytePlus Seed Speech TTS returned malformed base64 audio data");
+          }
+          chunks.push(Buffer.from(canonicalAudio, "base64"));
         }
         continue;
       }
@@ -189,6 +188,9 @@ async function seedSpeechTTS(params: VolcengineTTSParams & { apiKey: string }): 
 async function legacyVolcengineTTS(
   params: VolcengineTTSParams & { appId: string; token: string },
 ): Promise<Buffer> {
+  const { canonicalizeBase64 } = await import("openclaw/plugin-sdk/media-runtime");
+  const { readResponseWithLimit } = await import("openclaw/plugin-sdk/response-limit-runtime");
+  const { fetchWithSsrFGuard } = await import("openclaw/plugin-sdk/ssrf-runtime");
   const {
     text,
     appId,
@@ -196,9 +198,9 @@ async function legacyVolcengineTTS(
     voice = DEFAULT_LEGACY_VOICE,
     cluster = DEFAULT_CLUSTER,
     baseUrl = VOLCENGINE_LEGACY_TTS_URL,
-    speedRatio = 1.0,
-    volumeRatio = 1.0,
-    pitchRatio = 1.0,
+    speedRatio = 1,
+    volumeRatio = 1,
+    pitchRatio = 1,
     emotion,
     encoding = "ogg_opus",
     timeoutMs = 30_000,
@@ -234,18 +236,28 @@ async function legacyVolcengineTTS(
       body: payload,
     },
     timeoutMs,
-    policy: { hostnameAllowlist: hostnameAllowlist(baseUrl) },
+    policy: { hostnameAllowlist: [new URL(baseUrl).hostname] },
     auditContext: "volcengine.tts",
   });
 
   try {
-    const body = parseLegacyTtsResponse(await response.text());
+    const responseText = new TextDecoder("utf-8", { fatal: true }).decode(
+      await readResponseWithLimit(response, VOLCENGINE_TTS_RESPONSE_MAX_BYTES, {
+        onOverflow: ({ maxBytes }) =>
+          new Error(`Volcengine TTS response exceeds ${maxBytes} bytes`),
+      }),
+    );
+    const body = toTtsResponse(parseJsonObject(responseText, "Volcengine"));
     if (!response.ok || body.code !== 3000 || !body.data) {
       throw new Error(
         `Volcengine TTS error ${body.code ?? response.status}: ${body.message ?? "unknown"}`,
       );
     }
-    return Buffer.from(body.data, "base64");
+    const canonicalAudio = canonicalizeBase64(body.data);
+    if (!canonicalAudio) {
+      throw new Error("Volcengine TTS returned malformed base64 audio data");
+    }
+    return Buffer.from(canonicalAudio, "base64");
   } finally {
     await release();
   }

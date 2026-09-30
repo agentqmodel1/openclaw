@@ -1,13 +1,14 @@
-import { parseStandardSetUnsetSlashCommand } from "./commands-setunset-standard.js";
+// Implements MCP server command parsing and persisted enablement settings.
+import { parseSlashCommandWithSetUnset } from "./commands-setunset.js";
 
-export type McpCommand =
+type McpCommand =
   | { action: "show"; name?: string }
   | { action: "set"; name: string; value: unknown }
   | { action: "unset"; name: string }
   | { action: "error"; message: string };
 
 export function parseMcpCommand(raw: string): McpCommand | null {
-  return parseStandardSetUnsetSlashCommand<McpCommand>({
+  return parseSlashCommandWithSetUnset<McpCommand>({
     raw,
     slash: "/mcp",
     invalidMessage: "Invalid /mcp syntax.",
@@ -20,5 +21,6 @@ export function parseMcpCommand(raw: string): McpCommand | null {
     },
     onSet: (name, value) => ({ action: "set", name, value }),
     onUnset: (name) => ({ action: "unset", name }),
+    onError: (message) => ({ action: "error", message }),
   });
 }

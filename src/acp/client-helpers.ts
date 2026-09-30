@@ -1,43 +1,29 @@
+/** Permission, environment, and spawn helpers for the standalone ACP client. */
 import * as readline from "node:readline";
 import type { RequestPermissionRequest, RequestPermissionResponse } from "@agentclientprotocol/sdk";
+import {
+  normalizeLowercaseStringOrEmpty,
+  normalizeOptionalString,
+} from "@openclaw/normalization-core/string-coerce";
+import { sanitizeTerminalText } from "../../packages/terminal-core/src/safe-text.js";
 import {
   materializeWindowsSpawnProgram,
   resolveWindowsSpawnProgram,
 } from "../plugin-sdk/windows-spawn.js";
 import {
-  listKnownProviderAuthEnvVarNames,
+  listKnownProviderAuthEnvVarNamesCore,
   omitEnvKeysCaseInsensitive,
 } from "../secrets/provider-env-vars.js";
-import {
-  normalizeLowercaseStringOrEmpty,
-  normalizeOptionalString,
-} from "../shared/string-coerce.js";
-import { sanitizeTerminalText } from "../terminal/safe-text.js";
-import { classifyAcpToolApproval, type AcpApprovalClass } from "./approval-classifier.js";
+import { classifyAcpToolApproval } from "./approval-classifier.js";
 
 type PermissionOption = RequestPermissionRequest["options"][number];
 
+// ACP permission resolution keeps readonly tool classes noninteractive and prompts for risky tools.
 type PermissionResolverDeps = {
   prompt?: (toolName: string | undefined, toolTitle?: string) => Promise<boolean>;
   log?: (line: string) => void;
   cwd?: string;
 };
-
-function resolveToolKindForPermission(
-  toolName: string | undefined,
-  approvalClass: AcpApprovalClass,
-): string | undefined {
-  if (!toolName && approvalClass === "unknown") {
-    return undefined;
-  }
-  if (approvalClass === "readonly_scoped") {
-    return "readonly_scoped";
-  }
-  if (approvalClass === "readonly_search") {
-    return "readonly_search";
-  }
-  return approvalClass;
-}
 
 function pickOption(
   options: PermissionOption[],
@@ -100,6 +86,7 @@ function promptUserPermission(toolName: string | undefined, toolTitle?: string):
   });
 }
 
+/** Converts an ACP permission request into a selected allow/reject option or cancellation. */
 export async function resolvePermissionRequest(
   params: RequestPermissionRequest,
   deps: PermissionResolverDeps = {},
@@ -111,7 +98,10 @@ export async function resolvePermissionRequest(
   const toolTitle = sanitizeTerminalText(params.toolCall?.title ?? "tool");
   const classification = classifyAcpToolApproval({ toolCall: params.toolCall, cwd });
   const toolName = classification.toolName;
-  const toolKind = resolveToolKindForPermission(toolName, classification.approvalClass);
+  const toolKind =
+    !toolName && classification.approvalClass === "unknown"
+      ? undefined
+      : classification.approvalClass;
 
   if (options.length === 0) {
     log(`[permission cancelled] ${toolName ?? "unknown"}: no options available`);
@@ -123,13 +113,12 @@ export async function resolvePermissionRequest(
   const promptRequired = !classification.autoApprove;
 
   if (!promptRequired) {
-    const option = allowOption ?? options[0];
-    if (!option) {
-      log(`[permission cancelled] ${toolName}: no selectable options`);
+    if (!allowOption) {
+      log(`[permission cancelled] ${toolName ?? "unknown"}: missing allow option`);
       return cancelledPermission();
     }
     log(`[permission auto-approved] ${toolName} (${toolKind ?? "unknown"})`);
-    return selectedPermission(option.optionId);
+    return selectedPermission(allowOption.optionId);
   }
 
   log(
@@ -154,6 +143,7 @@ type AcpClientSpawnEnvOptions = {
   stripKeys?: Iterable<string>;
 };
 
+/** Builds the sanitized environment used when spawning an ACP client process. */
 export function resolveAcpClientSpawnEnv(
   baseEnv: NodeJS.ProcessEnv = process.env,
   options: AcpClientSpawnEnvOptions = {},
@@ -163,6 +153,7 @@ export function resolveAcpClientSpawnEnv(
   return env;
 }
 
+/** Returns true when the client should hide provider credentials from the spawned server. */
 export function shouldStripProviderAuthEnvVarsForAcpServer(
   params: {
     serverCommand?: string;
@@ -187,13 +178,14 @@ export function shouldStripProviderAuthEnvVarsForAcpServer(
   );
 }
 
+/** Builds the exact environment variable denylist used for ACP client subprocesses. */
 export function buildAcpClientStripKeys(params: {
   stripProviderAuthEnvVars?: boolean;
   activeSkillEnvKeys?: Iterable<string>;
 }): Set<string> {
   const stripKeys = new Set<string>(params.activeSkillEnvKeys ?? []);
   if (params.stripProviderAuthEnvVars) {
-    for (const key of listKnownProviderAuthEnvVarNames()) {
+    for (const key of listKnownProviderAuthEnvVarNamesCore()) {
       stripKeys.add(key);
     }
   }
@@ -212,6 +204,7 @@ const DEFAULT_ACP_SPAWN_RUNTIME: AcpSpawnRuntime = {
   execPath: process.execPath,
 };
 
+/** Resolves the executable/args used to spawn an ACP server, including Windows shims. */
 export function resolveAcpClientSpawnInvocation(
   params: { serverCommand: string; serverArgs: string[] },
   runtime: AcpSpawnRuntime = DEFAULT_ACP_SPAWN_RUNTIME,

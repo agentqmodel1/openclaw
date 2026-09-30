@@ -1,7 +1,8 @@
-import fs from "node:fs/promises";
-import os from "node:os";
+import fs, { type FileHandle } from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline";
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
+import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import {
   isSilentReplyPrefixText,
   isSilentReplyText,
@@ -10,13 +11,26 @@ import {
   stripLeadingSilentToken,
 } from "../../auto-reply/tokens.js";
 import {
+  isToolCallBlock,
+  resolveToolUseId,
+  type ToolContentBlock,
+} from "../../chat/tool-content.js";
+import {
+  readSessionTranscriptBoundedMessageTailPage,
+  type SessionTranscriptRuntimeTarget,
+  waitForSessionTranscriptProjection,
+} from "../../config/sessions/session-accessor.js";
+import {
   type ClaudeCliFallbackSeed,
   readClaudeCliFallbackSeed,
 } from "../../gateway/cli-session-history.js";
+import { buildAgentRunTerminalReplySnapshot } from "../agent-run-terminal-reply.js";
+import type { AgentRunTerminalReplySnapshot } from "../agent-run-terminal-reply.types.js";
+import type { ExecApprovalContinuationPromptRange } from "../bash-tools.exec-approval-output.js";
+import { cliBackendLog } from "../cli-runner/log.js";
+import { resolveClaudeCliProjectDirForWorkspace } from "./claude-cli-project-dir.js";
 
-/** Maximum number of JSONL records to inspect before giving up. */
-const SESSION_FILE_MAX_RECORDS = 500;
-const CLAUDE_PROJECTS_RELATIVE_DIR = path.join(".claude", "projects");
+const CLAUDE_CLI_TRANSCRIPT_MAX_RECORDS = 500;
 
 function normalizeClaudeCliSessionId(sessionId: string | undefined): string | undefined {
   const trimmed = sessionId?.trim();
@@ -26,18 +40,34 @@ function normalizeClaudeCliSessionId(sessionId: string | undefined): string | un
   return trimmed;
 }
 
-async function jsonlFileHasAssistantMessage(filePath: string | undefined): Promise<boolean> {
-  if (!filePath) {
-    return false;
-  }
+type JsonlFileScan = { fileExists: boolean; hasAssistant: boolean };
+
+async function readCliTranscriptFile<T>(
+  filePath: string,
+  missing: T,
+  read: (file: FileHandle, size: number) => Promise<T>,
+): Promise<T> {
   try {
     const stat = await fs.lstat(filePath);
     if (stat.isSymbolicLink() || !stat.isFile()) {
-      return false;
+      return missing;
     }
-
-    const fh = await fs.open(filePath, "r");
+    const file = await fs.open(filePath, "r");
     try {
+      return await read(file, stat.size);
+    } finally {
+      await file.close();
+    }
+  } catch {
+    return missing;
+  }
+}
+
+async function scanJsonlFile(filePath: string): Promise<JsonlFileScan> {
+  return await readCliTranscriptFile<JsonlFileScan>(
+    filePath,
+    { fileExists: false, hasAssistant: false },
+    async (fh) => {
       const rl = readline.createInterface({ input: fh.createReadStream({ encoding: "utf-8" }) });
       let recordCount = 0;
       for await (const line of rl) {
@@ -45,7 +75,7 @@ async function jsonlFileHasAssistantMessage(filePath: string | undefined): Promi
           continue;
         }
         recordCount++;
-        if (recordCount > SESSION_FILE_MAX_RECORDS) {
+        if (recordCount > CLAUDE_CLI_TRANSCRIPT_MAX_RECORDS) {
           break;
         }
         let obj: unknown;
@@ -56,53 +86,173 @@ async function jsonlFileHasAssistantMessage(filePath: string | undefined): Promi
         }
         const rec = obj as Record<string, unknown> | null;
         if ((rec?.message as Record<string, unknown> | undefined)?.role === "assistant") {
-          return true;
+          return { fileExists: true, hasAssistant: true };
         }
       }
-      return false;
-    } finally {
-      await fh.close();
-    }
-  } catch {
+      return { fileExists: true, hasAssistant: false };
+    },
+  );
+}
+
+/** Checks whether the active SQLite history contains a persisted assistant turn. */
+export async function sessionTranscriptHasContent(
+  target: SessionTranscriptRuntimeTarget | undefined,
+  abortSignal?: AbortSignal,
+): Promise<boolean> {
+  if (!target) {
     return false;
   }
+  await waitForSessionTranscriptProjection(target, abortSignal);
+  const { events } = readSessionTranscriptBoundedMessageTailPage(target, {
+    maxBytes: 5 * 1024 * 1024,
+    maxMessages: 500,
+    offset: 0,
+  });
+  return events.some(
+    ({ event }) =>
+      isRecord(event) &&
+      event.type === "message" &&
+      isRecord(event.message) &&
+      event.message.role === "assistant",
+  );
 }
 
-/**
- * Check whether a session transcript file exists and contains at least one
- * assistant message, indicating that the SessionManager has flushed the
- * initial user+assistant exchange to disk.
- */
-export async function sessionFileHasContent(sessionFile: string | undefined): Promise<boolean> {
-  return await jsonlFileHasAssistantMessage(sessionFile);
-}
-
-export async function claudeCliSessionTranscriptHasContent(params: {
+function claudeCliSessionTranscriptPath(params: {
   sessionId: string | undefined;
+  workspaceDir: string | undefined;
   homeDir?: string;
-}): Promise<boolean> {
+}): string | null {
   const sessionId = normalizeClaudeCliSessionId(params.sessionId);
   if (!sessionId) {
+    return null;
+  }
+  const workspaceDir = params.workspaceDir?.trim();
+  if (!workspaceDir) {
+    return null;
+  }
+  return path.join(
+    resolveClaudeCliProjectDirForWorkspace({
+      workspaceDir,
+      homeDir: params.homeDir,
+    }),
+    `${sessionId}.jsonl`,
+  );
+}
+
+const CLAUDE_CLI_TRANSCRIPT_FLUSH_GRACE_MS = 250;
+const CLAUDE_CLI_ORPHAN_PROBE_TAIL_BYTES = 1024 * 1024;
+
+export async function claudeCliSessionTranscriptHasContent(
+  params: Parameters<typeof claudeCliSessionTranscriptPath>[0],
+): Promise<boolean> {
+  const expectedPath = claudeCliSessionTranscriptPath(params);
+  if (!expectedPath) {
     return false;
   }
-  const homeDir = params.homeDir?.trim() || process.env.HOME || os.homedir();
-  const projectsDir = path.join(homeDir, CLAUDE_PROJECTS_RELATIVE_DIR);
-  let projectEntries: import("node:fs").Dirent[];
-  try {
-    projectEntries = await fs.readdir(projectsDir, { withFileTypes: true });
-  } catch {
-    return false;
+  const first = await scanJsonlFile(expectedPath);
+  if (first.hasAssistant) {
+    return true;
   }
-  for (const entry of projectEntries) {
-    if (!entry.isDirectory()) {
-      continue;
-    }
-    const candidate = path.join(projectsDir, entry.name, `${sessionId}.jsonl`);
-    if (await jsonlFileHasAssistantMessage(candidate)) {
-      return true;
-    }
+  await new Promise<void>((resolve) => {
+    setTimeout(resolve, CLAUDE_CLI_TRANSCRIPT_FLUSH_GRACE_MS);
+  });
+  const second = await scanJsonlFile(expectedPath);
+  if (second.hasAssistant) {
+    return true;
   }
+  const sessionId = normalizeClaudeCliSessionId(params.sessionId);
+  cliBackendLog.warn(
+    `claude-cli transcript probe v4 miss (sessionId-deterministic path, grace ${CLAUDE_CLI_TRANSCRIPT_FLUSH_GRACE_MS}ms): sessionId=${sessionId ?? ""} expectedPath=${expectedPath} fileExists=${second.fileExists}`,
+  );
   return false;
+}
+
+function toToolContentBlocks(content: unknown): ToolContentBlock[] | undefined {
+  if (!Array.isArray(content)) {
+    return undefined;
+  }
+  return content.filter((item): item is ToolContentBlock =>
+    Boolean(item && typeof item === "object"),
+  );
+}
+
+function isClaudeTranscriptToolUseBlock(block: ToolContentBlock): boolean {
+  const type = block.type;
+  return type === "tool_use" || type === "server_tool_use" || type === "mcp_tool_use";
+}
+
+function isClaudeTranscriptToolResultBlock(block: ToolContentBlock): boolean {
+  const type = block.type;
+  return type === "tool_result" || (typeof type === "string" && type.endsWith("_tool_result"));
+}
+
+async function jsonlFileHasOrphanedTrailingToolUse(filePath: string): Promise<boolean> {
+  return await readCliTranscriptFile(filePath, false, async (fh, size) => {
+    const tailBytes = Math.min(size, CLAUDE_CLI_ORPHAN_PROBE_TAIL_BYTES);
+    const start = size - tailBytes;
+    const buffer = Buffer.alloc(tailBytes);
+    const { bytesRead } = await fh.read(buffer, 0, tailBytes, start);
+    let tailText = buffer.toString("utf-8", 0, bytesRead);
+    if (start > 0) {
+      const firstNewline = tailText.indexOf("\n");
+      tailText = firstNewline === -1 ? "" : tailText.slice(firstNewline + 1);
+    }
+    let lastAssistantToolUseIds: Set<string> = new Set();
+    let answeredToolResultIds: Set<string> = new Set();
+    for (const line of tailText.split(/\r?\n/)) {
+      if (!line.trim()) {
+        continue;
+      }
+      let obj: unknown;
+      try {
+        obj = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      const rec = obj as Record<string, unknown> | null;
+      if (rec?.isSidechain === true) {
+        continue;
+      }
+      const message = rec?.message as Record<string, unknown> | undefined;
+      const role = message?.role;
+      if (role === "assistant") {
+        lastAssistantToolUseIds = new Set();
+        answeredToolResultIds = new Set();
+      } else if (role !== "user") {
+        continue;
+      }
+      for (const block of toToolContentBlocks(message?.content) ?? []) {
+        const target =
+          role === "assistant" && isClaudeTranscriptToolUseBlock(block)
+            ? lastAssistantToolUseIds
+            : isClaudeTranscriptToolResultBlock(block)
+              ? answeredToolResultIds
+              : undefined;
+        if (target) {
+          const id = resolveToolUseId(block);
+          if (id) {
+            target.add(id);
+          }
+        }
+      }
+    }
+    for (const id of lastAssistantToolUseIds) {
+      if (!answeredToolResultIds.has(id)) {
+        return true;
+      }
+    }
+    return false;
+  });
+}
+
+export async function claudeCliSessionTranscriptHasOrphanedToolUse(
+  params: Parameters<typeof claudeCliSessionTranscriptPath>[0],
+): Promise<boolean> {
+  const expectedPath = claudeCliSessionTranscriptPath(params);
+  if (!expectedPath) {
+    return false;
+  }
+  return await jsonlFileHasOrphanedTrailingToolUse(expectedPath);
 }
 
 export function resolveFallbackRetryPrompt(params: {
@@ -118,12 +268,7 @@ export function resolveFallbackRetryPrompt(params: {
   if (!params.sessionHasHistory && !prelude) {
     return params.body;
   }
-  // Even with persisted session history, fully replacing the body with a
-  // generic "continue where you left off" message strips the original task
-  // from the fallback model's view. Agents then have to reconstruct the
-  // instruction from history alone, which is fragile and sometimes
-  // impossible. Prepend the retry context to the original body instead so
-  // the fallback model has both the recovery signal AND the task. (#65760)
+  // Retain the original task: failed history may not contain enough context to reconstruct it. (#65760)
   const retryMarked = `[Retry after the previous model attempt failed or timed out]\n\n${params.body}`;
   return prelude ? `${prelude}\n\n${retryMarked}` : retryMarked;
 }
@@ -158,7 +303,7 @@ function extractFallbackTurnText(message: FallbackTurnLikeMessage): string {
     // Tool calls: render as a compact "(tool: name)" hint so the fallback
     // model sees the conversation flow without the full tool argument blob,
     // which is rarely useful out of context and chews through char budget.
-    if (rec.type === "tool_use" && typeof rec.name === "string") {
+    if (isToolCallBlock(rec) && typeof rec.name === "string") {
       parts.push(`(tool call: ${rec.name})`);
       continue;
     }
@@ -177,9 +322,9 @@ function extractFallbackTurnText(message: FallbackTurnLikeMessage): string {
 function formatFallbackTurns(
   turns: ReadonlyArray<FallbackTurnLikeMessage>,
   remainingBudget: number,
-): { text: string; consumed: number } {
+): string {
   if (turns.length === 0 || remainingBudget <= 0) {
-    return { text: "", consumed: 0 };
+    return "";
   }
   const lines: string[] = [];
   let consumed = 0;
@@ -200,22 +345,15 @@ function formatFallbackTurns(
     if (consumed + line.length + 1 > remainingBudget) {
       break;
     }
-    lines.unshift(line);
+    lines.push(line);
     consumed += line.length + 1;
   }
-  return { text: lines.join("\n"), consumed };
+  lines.reverse();
+  return lines.join("\n");
 }
 
-/**
- * Format a previously-harvested Claude CLI session into a labeled prelude
- * suitable for prepending to a fallback candidate's prompt. Behavior matches
- * Claude Code's own resume strategy after compaction: prefer the explicit
- * summary, then append the most recent turns up to a char budget.
- *
- * Returns an empty string when neither a summary nor any usable turn fits in
- * the budget; callers can treat that as "no context to seed".
- */
-export function formatClaudeCliFallbackPrelude(
+/** Prefer the harvested summary, then retain recent turns within the fallback prompt budget. */
+function formatClaudeCliFallbackPrelude(
   seed: ClaudeCliFallbackSeed,
   options?: { charBudget?: number },
 ): string {
@@ -235,7 +373,7 @@ export function formatClaudeCliFallbackPrelude(
       // Truncate the summary at a word boundary if it's huge; clearly mark
       // the truncation so the fallback model treats the prelude as a hint,
       // not exhaustive state.
-      const slice = seed.summaryText.slice(0, Math.max(0, remaining - 64));
+      const slice = truncateUtf16Safe(seed.summaryText, Math.max(0, remaining - 64));
       const lastBreak = slice.lastIndexOf(" ");
       const trimmed = lastBreak > 0 ? slice.slice(0, lastBreak).trimEnd() : slice.trimEnd();
       sections.push(`\nSummary of earlier conversation (truncated):\n${trimmed} …`);
@@ -243,7 +381,7 @@ export function formatClaudeCliFallbackPrelude(
     }
   }
   if (remaining > CLAUDE_CLI_FALLBACK_PRELUDE_MIN_TURN_CHARS && seed.recentTurns.length > 0) {
-    const { text } = formatFallbackTurns(
+    const text = formatFallbackTurns(
       seed.recentTurns as ReadonlyArray<FallbackTurnLikeMessage>,
       remaining - 32,
     );
@@ -259,11 +397,7 @@ export function formatClaudeCliFallbackPrelude(
   return sections.join("\n");
 }
 
-/**
- * Read the Claude CLI session pointed to by `cliSessionId` and format a
- * fallback prelude. Returns `""` when no session file is found or when the
- * harvested seed has no usable content.
- */
+/** Read a CLI session and project the available fallback context. */
 export function buildClaudeCliFallbackContextPrelude(params: {
   cliSessionId: string | undefined;
   homeDir?: string;
@@ -280,6 +414,7 @@ export function buildClaudeCliFallbackContextPrelude(params: {
   return formatClaudeCliFallbackPrelude(seed, { charBudget: params.charBudget });
 }
 
+/** Creates an accumulator that strips ACP silent-reply prefixes while streaming. */
 export function createAcpVisibleTextAccumulator() {
   let pendingSilentPrefix = "";
   let visibleText = "";
@@ -301,20 +436,6 @@ export function createAcpVisibleTextAccumulator() {
       return chunk;
     }
     return `${base}${chunk}`;
-  };
-
-  const mergeVisibleChunk = (base: string, chunk: string): { rawText: string; delta: string } => {
-    if (!base) {
-      return { rawText: chunk, delta: chunk };
-    }
-    if (chunk.startsWith(base) && chunk.length > base.length) {
-      const delta = chunk.slice(base.length);
-      return { rawText: chunk, delta };
-    }
-    return {
-      rawText: `${base}${chunk}`,
-      delta: chunk,
-    };
   };
 
   return {
@@ -355,13 +476,13 @@ export function createAcpVisibleTextAccumulator() {
         }
       }
 
-      const nextVisible = mergeVisibleChunk(rawVisibleText, chunk);
-      rawVisibleText = nextVisible.rawText;
-      if (!nextVisible.delta) {
-        return null;
-      }
-      visibleText = `${visibleText}${nextVisible.delta}`;
-      return { text: visibleText, delta: nextVisible.delta };
+      const delta =
+        chunk.startsWith(rawVisibleText) && chunk.length > rawVisibleText.length
+          ? chunk.slice(rawVisibleText.length)
+          : chunk;
+      rawVisibleText += delta;
+      visibleText += delta;
+      return { text: visibleText, delta };
     },
     finalize(): string {
       return visibleText.trim();
@@ -369,5 +490,29 @@ export function createAcpVisibleTextAccumulator() {
     finalizeRaw(): string {
       return visibleText;
     },
+    finalizeReplySnapshot(): AgentRunTerminalReplySnapshot {
+      return buildAgentRunTerminalReplySnapshot({
+        visibleText,
+        rawText: pendingSilentPrefix,
+      });
+    },
+  };
+}
+
+export function rebaseExecApprovalContinuationPromptRange(params: {
+  body: string;
+  prompt: string;
+  range?: ExecApprovalContinuationPromptRange;
+}): ExecApprovalContinuationPromptRange | undefined {
+  if (!params.range) {
+    return undefined;
+  }
+  if (!params.prompt.endsWith(params.body)) {
+    throw new Error("exec approval continuation prompt range could not be rebased");
+  }
+  const offset = params.prompt.length - params.body.length;
+  return {
+    start: offset + params.range.start,
+    end: offset + params.range.end,
   };
 }

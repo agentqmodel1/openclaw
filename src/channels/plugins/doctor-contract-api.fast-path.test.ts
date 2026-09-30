@@ -1,3 +1,4 @@
+// Doctor contract API fast-path tests cover lightweight channel doctor contract loading.
 import { describe, expect, it, vi } from "vitest";
 
 const { loadBundledPluginPublicArtifactModuleSyncMock } = vi.hoisted(() => ({
@@ -16,16 +17,6 @@ const { loadBundledPluginPublicArtifactModuleSyncMock } = vi.hoisted(() => ({
       if (dirName === "whatsapp" && artifactBasename === "doctor-contract-api.js") {
         return {
           legacyConfigRules: [],
-        };
-      }
-      if (dirName === "telegram" && artifactBasename === "doctor-contract-api.js") {
-        return {
-          legacyConfigRules: [
-            {
-              path: ["channels", "telegram", "groupMentionsOnly"],
-              message: "legacy telegram rule",
-            },
-          ],
         };
       }
       throw new Error(
@@ -54,44 +45,34 @@ describe("channel doctor contract api fast path", () => {
     expect(loadBundledPluginPublicArtifactModuleSyncMock).toHaveBeenCalledWith({
       dirName: "discord",
       artifactBasename: "doctor-contract-api.js",
-      installRuntimeDeps: false,
     });
   });
 
   it("treats empty explicit doctor contract rules as authoritative", () => {
     const api = loadBundledChannelDoctorContractApi("whatsapp");
 
-    expect(api?.legacyConfigRules).toEqual([]);
+    expect(api?.legacyConfigRules).toStrictEqual([]);
     expect(loadBundledPluginPublicArtifactModuleSyncMock).toHaveBeenCalledWith({
       dirName: "whatsapp",
       artifactBasename: "doctor-contract-api.js",
-      installRuntimeDeps: false,
     });
     expect(loadBundledPluginPublicArtifactModuleSyncMock).not.toHaveBeenCalledWith({
       dirName: "whatsapp",
       artifactBasename: "contract-api.js",
-      installRuntimeDeps: false,
     });
   });
 
-  it("uses the explicit Telegram doctor contract artifact", () => {
-    const api = loadBundledChannelDoctorContractApi("telegram");
+  it("does not fall back to the broad contract-api artifact when the doctor artifact is missing", () => {
+    const api = loadBundledChannelDoctorContractApi("missing");
 
-    expect(api?.legacyConfigRules).toEqual([
-      {
-        path: ["channels", "telegram", "groupMentionsOnly"],
-        message: "legacy telegram rule",
-      },
-    ]);
+    expect(api).toBeUndefined();
     expect(loadBundledPluginPublicArtifactModuleSyncMock).toHaveBeenCalledWith({
-      dirName: "telegram",
+      dirName: "missing",
       artifactBasename: "doctor-contract-api.js",
-      installRuntimeDeps: false,
     });
     expect(loadBundledPluginPublicArtifactModuleSyncMock).not.toHaveBeenCalledWith({
-      dirName: "telegram",
+      dirName: "missing",
       artifactBasename: "contract-api.js",
-      installRuntimeDeps: false,
     });
   });
 });

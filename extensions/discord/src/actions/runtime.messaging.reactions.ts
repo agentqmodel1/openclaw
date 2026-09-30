@@ -1,10 +1,10 @@
 import {
   jsonResult,
-  readNumberParam,
+  readPositiveIntegerParam,
   readReactionParams,
   readStringParam,
-} from "../runtime-api.js";
-import { discordMessagingActionRuntime } from "./runtime.messaging.runtime.js";
+} from "openclaw/plugin-sdk/channel-actions";
+import * as discordMessagingActionRuntime from "../send.js";
 import type { DiscordMessagingActionContext } from "./runtime.messaging.shared.js";
 
 export async function handleDiscordReactionMessagingAction(ctx: DiscordMessagingActionContext) {
@@ -20,6 +20,7 @@ export async function handleDiscordReactionMessagingAction(ctx: DiscordMessaging
       const { emoji, remove, isEmpty } = readReactionParams(ctx.params, {
         removeErrorMessage: "Emoji is required to remove a Discord reaction.",
       });
+      await ctx.assertReadTargetAllowed({ channelId });
       if (remove) {
         await discordMessagingActionRuntime.removeReactionDiscord(
           channelId,
@@ -53,7 +54,8 @@ export async function handleDiscordReactionMessagingAction(ctx: DiscordMessaging
       const messageId = readStringParam(ctx.params, "messageId", {
         required: true,
       });
-      const limit = readNumberParam(ctx.params, "limit");
+      const limit = readPositiveIntegerParam(ctx.params, "limit");
+      await ctx.assertReadTargetAllowed({ channelId });
       const reactions = await discordMessagingActionRuntime.fetchReactionsDiscord(
         channelId,
         messageId,

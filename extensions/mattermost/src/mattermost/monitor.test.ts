@@ -1,183 +1,90 @@
-import { createClaimableDedupe } from "openclaw/plugin-sdk/persistent-dedupe";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+// Mattermost tests cover monitor plugin behavior.
+import { describe, expect, it } from "vitest";
 import type { OpenClawConfig } from "../../runtime-api.js";
 import { resolveMattermostAccount } from "./accounts.js";
-import * as clientModule from "./client.js";
-import type { MattermostClient } from "./client.js";
 import {
+  buildMattermostButtonInteractionMessageSid,
   buildMattermostModelPickerSelectMessageSid,
   canFinalizeMattermostPreviewInPlace,
-  deliverMattermostReplyWithDraftPreview,
-  evaluateMattermostMentionGate,
-  MattermostRetryableInboundError,
-  processMattermostReplayGuardedPost,
+  formatMattermostFinalDeliveryOutcomeLog,
+  resolveMattermostInteractionReplyRootId,
+  resolveMattermostPendingHistoryKey,
   resolveMattermostReactionChannelId,
-  resolveMattermostEffectiveReplyToId,
   resolveMattermostReplyRootId,
   resolveMattermostThreadSessionContext,
-  shouldFinalizeMattermostPreviewAfterDispatch,
-  shouldClearMattermostDraftPreview,
-  type MattermostMentionGateInput,
-  type MattermostRequireMentionResolverInput,
-} from "./monitor.js";
+  shouldUpdateMattermostDraftToolProgress,
+} from "./monitor-context.js";
+import { buildMattermostInboundMediaPayload } from "./monitor-resources.js";
 
-function resolveRequireMentionForTest(params: MattermostRequireMentionResolverInput): boolean {
-  const root = params.cfg.channels?.mattermost;
-  const accountGroups = (
-    root?.accounts?.[params.accountId] as
-      | { groups?: Record<string, { requireMention?: boolean }> }
-      | undefined
-  )?.groups;
-  const groups = accountGroups ?? root?.groups;
-  const typedGroups = groups as Record<string, { requireMention?: boolean }> | undefined;
-  const groupConfig = params.groupId ? typedGroups?.[params.groupId] : undefined;
-  const defaultGroupConfig = typedGroups?.["*"];
-  const configMention =
-    typeof groupConfig?.requireMention === "boolean"
-      ? groupConfig.requireMention
-      : typeof defaultGroupConfig?.requireMention === "boolean"
-        ? defaultGroupConfig.requireMention
-        : undefined;
-  if (typeof configMention === "boolean") {
-    return configMention;
-  }
-  if (typeof params.requireMentionOverride === "boolean") {
-    return params.requireMentionOverride;
-  }
-  return true;
-}
-
-const updateMattermostPostSpy = vi.spyOn(clientModule, "updateMattermostPost");
-
-function createMattermostClientMock(): MattermostClient {
-  return {
-    baseUrl: "https://chat.example.com",
-    apiBaseUrl: "https://chat.example.com/api/v4",
-    token: "token",
-    request: vi.fn(async () => ({})) as MattermostClient["request"],
-    fetchImpl: vi.fn(
-      async () => new Response(null, { status: 200 }),
-    ) as MattermostClient["fetchImpl"],
-  };
-}
-
-function createDraftStreamMock(postId: string | undefined = "preview-post-1") {
-  return {
-    flush: vi.fn(async () => {}),
-    postId: vi.fn(() => postId),
-    clear: vi.fn(async () => {}),
-    discardPending: vi.fn(async () => {}),
-    seal: vi.fn(async () => {}),
-  };
-}
-
-beforeEach(() => {
-  vi.clearAllMocks();
-  updateMattermostPostSpy.mockResolvedValue({ id: "patched" } as never);
-});
-
-function evaluateMentionGateForMessage(params: { cfg: OpenClawConfig; threadRootId?: string }) {
-  const account = resolveMattermostAccount({ cfg: params.cfg, accountId: "default" });
-  const resolver = vi.fn(resolveRequireMentionForTest);
-  const input: MattermostMentionGateInput = {
-    kind: "channel",
-    cfg: params.cfg,
-    accountId: account.accountId,
-    channelId: "chan-1",
-    threadRootId: params.threadRootId,
-    requireMentionOverride: account.requireMention,
-    resolveRequireMention: resolver,
-    wasMentioned: false,
-    isControlCommand: false,
-    commandAuthorized: false,
-    oncharEnabled: false,
-    oncharTriggered: false,
-    canDetectMention: true,
-  };
-  const decision = evaluateMattermostMentionGate(input);
-  return { account, resolver, decision };
-}
-
-describe("mattermost mention gating", () => {
-  it("accepts unmentioned root channel posts in onmessage mode", () => {
-    const cfg: OpenClawConfig = {
-      channels: {
-        mattermost: {
-          chatmode: "onmessage",
-          groupPolicy: "open",
+describe("buildMattermostInboundMediaPayload", () => {
+  it("keeps a failed attachment kind aligned with a successful path", async () => {
+    await expect(
+      buildMattermostInboundMediaPayload([
+        { path: "/tmp/image.png", contentType: "image/png", kind: "image" },
+        { kind: "audio" },
+      ]),
+    ).resolves.toEqual({
+      MediaPath: "/tmp/image.png",
+      MediaUrl: "/tmp/image.png",
+      MediaType: "image/png",
+      MediaPaths: ["/tmp/image.png", ""],
+      MediaUrls: ["/tmp/image.png", ""],
+      MediaTypes: ["image/png", "audio"],
+      MediaTranscribedIndexes: undefined,
+      media: [
+        {
+          path: "/tmp/image.png",
+          url: undefined,
+          contentType: "image/png",
+          kind: "image",
+          transcribed: false,
+          messageId: undefined,
         },
-      },
-    };
-    const { resolver, decision } = evaluateMentionGateForMessage({ cfg });
-    expect(decision.dropReason).toBeNull();
-    expect(decision.shouldRequireMention).toBe(false);
-    expect(resolver).toHaveBeenCalledWith(
-      expect.objectContaining({
-        accountId: "default",
-        groupId: "chan-1",
-        requireMentionOverride: false,
-      }),
-    );
-  });
-
-  it("accepts unmentioned thread replies in onmessage mode", () => {
-    const cfg: OpenClawConfig = {
-      channels: {
-        mattermost: {
-          chatmode: "onmessage",
-          groupPolicy: "open",
+        {
+          path: undefined,
+          url: undefined,
+          contentType: undefined,
+          kind: "audio",
+          transcribed: false,
+          messageId: undefined,
         },
-      },
-    };
-    const { resolver, decision } = evaluateMentionGateForMessage({
-      cfg,
-      threadRootId: "thread-root-1",
+      ],
     });
-    expect(decision.dropReason).toBeNull();
-    expect(decision.shouldRequireMention).toBe(false);
-    const resolverCall = resolver.mock.calls.at(-1)?.[0];
-    expect(resolverCall?.groupId).toBe("chan-1");
-    expect(resolverCall?.groupId).not.toBe("thread-root-1");
   });
 
-  it("rejects unmentioned channel posts in oncall mode", () => {
-    const cfg: OpenClawConfig = {
-      channels: {
-        mattermost: {
-          chatmode: "oncall",
-          groupPolicy: "open",
+  it("keeps total failures as type-only media facts", async () => {
+    await expect(
+      buildMattermostInboundMediaPayload([
+        { kind: "video" },
+        { contentType: "application/pdf", kind: "document" },
+      ]),
+    ).resolves.toEqual({
+      MediaPath: undefined,
+      MediaUrl: undefined,
+      MediaType: "video",
+      MediaPaths: undefined,
+      MediaUrls: undefined,
+      MediaTypes: ["video", "application/pdf"],
+      MediaTranscribedIndexes: undefined,
+      media: [
+        {
+          path: undefined,
+          url: undefined,
+          contentType: undefined,
+          kind: "video",
+          transcribed: false,
+          messageId: undefined,
         },
-      },
-    };
-    const { decision, account } = evaluateMentionGateForMessage({ cfg });
-    expect(account.requireMention).toBe(true);
-    expect(decision.shouldRequireMention).toBe(true);
-    expect(decision.dropReason).toBe("missing-mention");
-  });
-});
-
-describe("resolveMattermostReplyRootId with block streaming payloads", () => {
-  it("uses threadRootId for block-streamed payloads with replyToId", () => {
-    // When block streaming sends a payload with replyToId from the threading
-    // mode, the deliver callback should still use the existing threadRootId.
-    expect(
-      resolveMattermostReplyRootId({
-        kind: "channel",
-        threadRootId: "thread-root-1",
-        replyToId: "streamed-reply-id",
-      }),
-    ).toBe("thread-root-1");
-  });
-
-  it("falls back to payload replyToId when no threadRootId in block streaming", () => {
-    // Top-level channel message: no threadRootId, payload carries the
-    // inbound post id as replyToId from the "all" threading mode.
-    expect(
-      resolveMattermostReplyRootId({
-        kind: "channel",
-        replyToId: "inbound-post-for-threading",
-      }),
-    ).toBe("inbound-post-for-threading");
+        {
+          path: undefined,
+          url: undefined,
+          contentType: "application/pdf",
+          kind: "document",
+          transcribed: false,
+          messageId: undefined,
+        },
+      ],
+    });
   });
 });
 
@@ -205,17 +112,18 @@ describe("resolveMattermostReplyRootId", () => {
     expect(resolveMattermostReplyRootId({ kind: "channel" })).toBeUndefined();
   });
 
-  it("keeps direct-message replies top-level even when a payload reply target exists", () => {
+  it("threads direct-message replies once a DM thread root exists", () => {
     expect(
       resolveMattermostReplyRootId({
         kind: "direct",
         threadRootId: "dm-root-456",
         replyToId: "dm-post-123",
       }),
-    ).toBeUndefined();
+    ).toBe("dm-root-456");
   });
 
-  it("keeps direct-message replies top-level when only the payload reply target exists", () => {
+  it("keeps flat direct-message replies top-level when there is no DM thread root", () => {
+    // A flat DM has no effective thread root, so a payload reply target stays flat.
     expect(
       resolveMattermostReplyRootId({
         kind: "direct",
@@ -223,39 +131,65 @@ describe("resolveMattermostReplyRootId", () => {
       }),
     ).toBeUndefined();
   });
+});
 
-  it("keeps group replies on the existing Mattermost thread root", () => {
+describe("resolveMattermostInteractionReplyRootId", () => {
+  const interactionMessageSid = buildMattermostButtonInteractionMessageSid({
+    postId: "source-post-123",
+    actionId: "approve",
+  });
+
+  it("keeps the established synthetic event identity", () => {
+    expect(interactionMessageSid).toBe("interaction:source-post-123:approve");
+  });
+
+  it("maps reply-to-current from the synthetic interaction id to the provider post", () => {
     expect(
-      resolveMattermostReplyRootId({
-        kind: "group",
-        threadRootId: "group-root-456",
-        replyToId: "group-child-789",
+      resolveMattermostInteractionReplyRootId({
+        kind: "channel",
+        replyToId: interactionMessageSid,
+        interactionMessageSid,
+        sourcePostId: "source-post-123",
       }),
-    ).toBe("group-root-456");
+    ).toBe("source-post-123");
+  });
+
+  it("preserves an explicit provider reply target", () => {
+    expect(
+      resolveMattermostInteractionReplyRootId({
+        kind: "channel",
+        replyToId: "other-provider-post",
+        interactionMessageSid,
+        sourcePostId: "source-post-123",
+      }),
+    ).toBe("other-provider-post");
+  });
+
+  it("keeps the existing provider thread root authoritative", () => {
+    expect(
+      resolveMattermostInteractionReplyRootId({
+        kind: "channel",
+        threadRootId: "thread-root-456",
+        replyToId: interactionMessageSid,
+        interactionMessageSid,
+        sourcePostId: "source-post-123",
+      }),
+    ).toBe("thread-root-456");
+  });
+
+  it("keeps flat direct-message interactions unthreaded", () => {
+    expect(
+      resolveMattermostInteractionReplyRootId({
+        kind: "direct",
+        replyToId: interactionMessageSid,
+        interactionMessageSid,
+        sourcePostId: "source-post-123",
+      }),
+    ).toBeUndefined();
   });
 });
 
 describe("canFinalizeMattermostPreviewInPlace", () => {
-  it("allows in-place finalization when the final reply target matches the preview thread", () => {
-    expect(
-      canFinalizeMattermostPreviewInPlace({
-        kind: "channel",
-        previewRootId: "thread-root-456",
-        threadRootId: "thread-root-456",
-        replyToId: "child-post-789",
-      }),
-    ).toBe(true);
-  });
-
-  it("prevents in-place finalization when a top-level preview would become a threaded reply", () => {
-    expect(
-      canFinalizeMattermostPreviewInPlace({
-        kind: "channel",
-        replyToId: "child-post-789",
-      }),
-    ).toBe(false);
-  });
-
   it("uses direct-message root suppression when checking in-place finalization", () => {
     expect(
       canFinalizeMattermostPreviewInPlace({
@@ -266,288 +200,137 @@ describe("canFinalizeMattermostPreviewInPlace", () => {
   });
 });
 
-describe("shouldClearMattermostDraftPreview", () => {
-  it("deletes the preview after successful normal final delivery", () => {
+describe("shouldUpdateMattermostDraftToolProgress", () => {
+  type MattermostConfig = NonNullable<NonNullable<OpenClawConfig["channels"]>["mattermost"]>;
+
+  function resolveToolProgressEnabled(mattermostConfig: MattermostConfig) {
+    const account = resolveMattermostAccount({
+      cfg: {
+        channels: {
+          mattermost: mattermostConfig,
+        },
+      },
+      accountId: "default",
+    });
+    return shouldUpdateMattermostDraftToolProgress(account);
+  }
+
+  it("shows tool status draft lines by default", () => {
+    expect(resolveToolProgressEnabled({ enabled: true })).toBe(true);
+  });
+
+  it("honors disabled progress-mode tool status lines", () => {
     expect(
-      shouldClearMattermostDraftPreview({
-        finalizedViaPreviewPost: false,
-        finalReplyDelivered: true,
-      }),
-    ).toBe(true);
-  });
-
-  it("keeps the preview when final delivery failed", () => {
-    expect(
-      shouldClearMattermostDraftPreview({
-        finalizedViaPreviewPost: false,
-        finalReplyDelivered: false,
-      }),
-    ).toBe(false);
-  });
-
-  it("keeps the preview when it already became the final reply", () => {
-    expect(
-      shouldClearMattermostDraftPreview({
-        finalizedViaPreviewPost: true,
-        finalReplyDelivered: true,
-      }),
-    ).toBe(false);
-  });
-});
-
-describe("deliverMattermostReplyWithDraftPreview", () => {
-  it("suppresses reasoning-prefixed finals before preview finalization", async () => {
-    const draftStream = createDraftStreamMock();
-    const deliverFinal = vi.fn(async () => {});
-
-    await deliverMattermostReplyWithDraftPreview({
-      payload: { text: "  \n > Reasoning:\n> _hidden_" } as never,
-      info: { kind: "final" },
-      kind: "channel",
-      client: createMattermostClientMock(),
-      draftStream,
-      effectiveReplyToId: "thread-root-1",
-      resolvePreviewFinalText: (text) => text?.trim(),
-      previewState: { finalizedViaPreviewPost: false },
-      logVerboseMessage: vi.fn(),
-      deliverFinal,
-    });
-
-    expect(deliverFinal).not.toHaveBeenCalled();
-    expect(draftStream.flush).not.toHaveBeenCalled();
-    expect(draftStream.discardPending).not.toHaveBeenCalled();
-    expect(draftStream.clear).not.toHaveBeenCalled();
-    expect(updateMattermostPostSpy).not.toHaveBeenCalled();
-  });
-
-  it("deletes the preview after a successful normal final send", async () => {
-    const draftStream = createDraftStreamMock();
-    const deliverFinal = vi.fn(async () => {});
-
-    await deliverMattermostReplyWithDraftPreview({
-      payload: { text: "All good", replyToId: "reply-1" } as never,
-      info: { kind: "final" },
-      kind: "channel",
-      client: createMattermostClientMock(),
-      draftStream,
-      resolvePreviewFinalText: (text) => text?.trim(),
-      previewState: { finalizedViaPreviewPost: false },
-      logVerboseMessage: vi.fn(),
-      deliverFinal,
-    });
-
-    expect(deliverFinal).toHaveBeenCalledTimes(1);
-    expect(draftStream.flush).not.toHaveBeenCalled();
-    expect(draftStream.discardPending).toHaveBeenCalledTimes(1);
-    expect(draftStream.clear).toHaveBeenCalledTimes(1);
-    expect(updateMattermostPostSpy).not.toHaveBeenCalled();
-  });
-
-  it("deletes the preview after a successful non-finalizable media final", async () => {
-    const draftStream = createDraftStreamMock();
-    const deliverFinal = vi.fn(async () => {});
-
-    await deliverMattermostReplyWithDraftPreview({
-      payload: {
-        text: "Photo",
-        replyToId: "reply-1",
-        mediaUrl: "https://example.com/a.png",
-      } as never,
-      info: { kind: "final" },
-      kind: "channel",
-      client: createMattermostClientMock(),
-      draftStream,
-      effectiveReplyToId: "thread-root-1",
-      resolvePreviewFinalText: (text) => text?.trim(),
-      previewState: { finalizedViaPreviewPost: false },
-      logVerboseMessage: vi.fn(),
-      deliverFinal,
-    });
-
-    expect(deliverFinal).toHaveBeenCalledTimes(1);
-    expect(draftStream.flush).not.toHaveBeenCalled();
-    expect(draftStream.discardPending).toHaveBeenCalledTimes(1);
-    expect(draftStream.clear).toHaveBeenCalledTimes(1);
-  });
-
-  it("does not flush error finals before normal delivery", async () => {
-    const draftStream = createDraftStreamMock();
-    const deliverFinal = vi.fn(async () => {});
-
-    await deliverMattermostReplyWithDraftPreview({
-      payload: { text: "Error", isError: true } as never,
-      info: { kind: "final" },
-      kind: "channel",
-      client: createMattermostClientMock(),
-      draftStream,
-      effectiveReplyToId: "thread-root-1",
-      resolvePreviewFinalText: (text) => text?.trim(),
-      previewState: { finalizedViaPreviewPost: false },
-      logVerboseMessage: vi.fn(),
-      deliverFinal,
-    });
-
-    expect(draftStream.flush).not.toHaveBeenCalled();
-    expect(deliverFinal).toHaveBeenCalledTimes(1);
-    expect(draftStream.clear).toHaveBeenCalledTimes(1);
-  });
-
-  it("finalizes the preview in place when the final targets the same thread", async () => {
-    const draftStream = createDraftStreamMock();
-    const deliverFinal = vi.fn(async () => {});
-
-    await deliverMattermostReplyWithDraftPreview({
-      payload: { text: "Final answer", replyToId: "child-post-789" } as never,
-      info: { kind: "final" },
-      kind: "channel",
-      client: createMattermostClientMock(),
-      draftStream,
-      effectiveReplyToId: "thread-root-456",
-      resolvePreviewFinalText: (text) => text?.trim(),
-      previewState: { finalizedViaPreviewPost: false },
-      logVerboseMessage: vi.fn(),
-      deliverFinal,
-    });
-
-    expect(updateMattermostPostSpy).toHaveBeenCalledWith(
-      expect.anything(),
-      "preview-post-1",
-      expect.objectContaining({ message: "Final answer" }),
-    );
-    expect(draftStream.flush).toHaveBeenCalledTimes(1);
-    expect(draftStream.seal).toHaveBeenCalledTimes(1);
-    expect(draftStream.seal.mock.invocationCallOrder[0]).toBeLessThan(
-      updateMattermostPostSpy.mock.invocationCallOrder[0] ?? Number.POSITIVE_INFINITY,
-    );
-    expect(deliverFinal).not.toHaveBeenCalled();
-    expect(draftStream.clear).not.toHaveBeenCalled();
-  });
-
-  it("keeps the existing preview unchanged when final delivery fails", async () => {
-    const draftStream = createDraftStreamMock();
-    const deliverFinal = vi.fn(async () => {
-      throw new Error("send failed");
-    });
-
-    await expect(
-      deliverMattermostReplyWithDraftPreview({
-        payload: { text: "Broken", replyToId: "reply-1" } as never,
-        info: { kind: "final" },
-        kind: "channel",
-        client: createMattermostClientMock(),
-        draftStream,
-        resolvePreviewFinalText: (text) => text?.trim(),
-        previewState: { finalizedViaPreviewPost: false },
-        logVerboseMessage: vi.fn(),
-        deliverFinal,
-      }),
-    ).rejects.toThrow("send failed");
-
-    expect(draftStream.discardPending).toHaveBeenCalledTimes(1);
-    expect(draftStream.clear).not.toHaveBeenCalled();
-    expect(updateMattermostPostSpy).not.toHaveBeenCalledWith(
-      expect.anything(),
-      "preview-post-1",
-      expect.objectContaining({ message: "↓ See below." }),
-    );
-  });
-});
-
-describe("shouldFinalizeMattermostPreviewAfterDispatch", () => {
-  it("reuses the preview only for a single eligible final payload", () => {
-    expect(
-      shouldFinalizeMattermostPreviewAfterDispatch({
-        finalCount: 1,
-        canFinalizeInPlace: true,
-      }),
-    ).toBe(true);
-  });
-
-  it("falls back to normal sends for multi-payload finals", () => {
-    expect(
-      shouldFinalizeMattermostPreviewAfterDispatch({
-        finalCount: 2,
-        canFinalizeInPlace: true,
+      resolveToolProgressEnabled({
+        streaming: {
+          mode: "progress",
+          progress: {
+            toolProgress: false,
+          },
+        },
       }),
     ).toBe(false);
   });
 
-  it("falls back to normal sends when the final cannot be edited into the preview", () => {
+  it("keeps tool status draft lines disabled when draft streaming is off", () => {
     expect(
-      shouldFinalizeMattermostPreviewAfterDispatch({
-        finalCount: 1,
-        canFinalizeInPlace: false,
+      resolveToolProgressEnabled({
+        streaming: {
+          mode: "off",
+          progress: {
+            toolProgress: true,
+          },
+        },
       }),
     ).toBe(false);
   });
 });
 
-describe("resolveMattermostEffectiveReplyToId", () => {
-  it("keeps an existing thread root", () => {
+describe("formatMattermostFinalDeliveryOutcomeLog", () => {
+  it("logs delivered only for visible text and media outcomes", () => {
     expect(
-      resolveMattermostEffectiveReplyToId({
-        kind: "channel",
-        postId: "post-123",
-        replyToMode: "all",
-        threadRootId: "thread-root-456",
+      formatMattermostFinalDeliveryOutcomeLog({
+        outcome: "text",
+        payload: { text: "hello" } as never,
+        to: "channel:town-square",
+        accountId: "default",
+        agentId: "agent-1",
       }),
-    ).toBe("thread-root-456");
+    ).toBe("delivered reply to channel:town-square");
+
+    expect(
+      formatMattermostFinalDeliveryOutcomeLog({
+        outcome: "media",
+        payload: { mediaUrl: "https://example.com/a.png" } as never,
+        to: "channel:town-square",
+        accountId: "default",
+        agentId: "agent-1",
+      }),
+    ).toBe("delivered reply to channel:town-square");
   });
 
-  it("suppresses existing thread roots when replyToMode is off", () => {
+  it("does not log delivered for empty no-send outcomes without diagnostic violations", () => {
     expect(
-      resolveMattermostEffectiveReplyToId({
-        kind: "channel",
-        postId: "post-123",
-        replyToMode: "off",
-        threadRootId: "thread-root-456",
+      formatMattermostFinalDeliveryOutcomeLog({
+        outcome: "empty",
+        payload: { text: "  \n\t " } as never,
+        to: "channel:town-square",
+        accountId: "default",
+        agentId: "agent-1",
       }),
     ).toBeUndefined();
   });
 
-  it("starts a thread for top-level channel messages when replyToMode is all", () => {
+  it("logs a diagnostic for substantive empty outcomes", () => {
     expect(
-      resolveMattermostEffectiveReplyToId({
-        kind: "channel",
-        postId: "post-123",
-        replyToMode: "all",
+      formatMattermostFinalDeliveryOutcomeLog({
+        outcome: "empty",
+        payload: { text: "work result" } as never,
+        to: "channel:town-square",
+        accountId: "default",
+        agentId: "agent-1",
       }),
-    ).toBe("post-123");
+    ).toBe(
+      "mattermost no-visible-reply: no-visible-reply-after-final-delivery" +
+        " to=channel:town-square" +
+        " accountId=default" +
+        " agentId=agent-1" +
+        " outcome=empty" +
+        " finalTextLength=11" +
+        " mediaUrlCount=0",
+    );
   });
 
-  it("starts a thread for top-level group messages when replyToMode is first", () => {
+  it("does not log reasoning-suppressed outcomes", () => {
     expect(
-      resolveMattermostEffectiveReplyToId({
-        kind: "group",
-        postId: "post-123",
-        replyToMode: "first",
-      }),
-    ).toBe("post-123");
-  });
-
-  it("keeps direct messages non-threaded", () => {
-    expect(
-      resolveMattermostEffectiveReplyToId({
-        kind: "direct",
-        postId: "post-123",
-        replyToMode: "all",
-      }),
-    ).toBeUndefined();
-  });
-
-  it("suppresses existing direct-message thread roots", () => {
-    expect(
-      resolveMattermostEffectiveReplyToId({
-        kind: "direct",
-        postId: "post-123",
-        replyToMode: "all",
-        threadRootId: "dm-root-456",
+      formatMattermostFinalDeliveryOutcomeLog({
+        outcome: "reasoning_skipped",
+        payload: { text: "Reasoning: hidden" } as never,
+        to: "channel:town-square",
+        accountId: "default",
+        agentId: "agent-1",
       }),
     ).toBeUndefined();
   });
 });
 
 describe("resolveMattermostThreadSessionContext", () => {
+  it("uses an existing direct-message thread root when threading is enabled", () => {
+    expect(
+      resolveMattermostThreadSessionContext({
+        baseSessionKey: "agent:main:mattermost:direct:user-1",
+        kind: "direct",
+        postId: "post-123",
+        replyToMode: "all",
+        threadRootId: "dm-root-456",
+      }),
+    ).toEqual({
+      effectiveReplyToId: "dm-root-456",
+      sessionKey: "agent:main:mattermost:direct:user-1:thread:dm-root-456",
+      parentSessionKey: undefined,
+    });
+  });
+
   it("forks channel sessions by top-level post when replyToMode is all", () => {
     expect(
       resolveMattermostThreadSessionContext({
@@ -561,6 +344,19 @@ describe("resolveMattermostThreadSessionContext", () => {
       sessionKey: "agent:main:mattermost:default:chan-1:thread:post-123",
       parentSessionKey: "agent:main:mattermost:default:chan-1",
     });
+  });
+
+  it("keeps DM threads as fresh independent sessions", () => {
+    const ctx = resolveMattermostThreadSessionContext({
+      baseSessionKey: "agent:main:mattermost:direct:user-1",
+      kind: "direct",
+      postId: "post-123",
+      replyToMode: "first",
+    });
+    expect(ctx.effectiveReplyToId).toBe("post-123");
+    expect(ctx.sessionKey).toBe("agent:main:mattermost:direct:user-1:thread:post-123");
+    // No parent-session inheritance: each DM topic is its own session.
+    expect(ctx.parentSessionKey).toBeUndefined();
   });
 
   it("keeps existing thread roots for threaded follow-ups", () => {
@@ -579,7 +375,7 @@ describe("resolveMattermostThreadSessionContext", () => {
     });
   });
 
-  it("keeps threaded messages top-level when replyToMode is off", () => {
+  it("keeps threaded messages in their Mattermost thread when replyToMode is off", () => {
     expect(
       resolveMattermostThreadSessionContext({
         baseSessionKey: "agent:main:mattermost:default:chan-1",
@@ -589,19 +385,34 @@ describe("resolveMattermostThreadSessionContext", () => {
         threadRootId: "root-456",
       }),
     ).toEqual({
+      effectiveReplyToId: "root-456",
+      sessionKey: "agent:main:mattermost:default:chan-1:thread:root-456",
+      parentSessionKey: "agent:main:mattermost:default:chan-1",
+    });
+  });
+
+  it("keeps top-level messages on the base session when replyToMode is off", () => {
+    expect(
+      resolveMattermostThreadSessionContext({
+        baseSessionKey: "agent:main:mattermost:default:chan-1",
+        kind: "group",
+        postId: "post-123",
+        replyToMode: "off",
+      }),
+    ).toEqual({
       effectiveReplyToId: undefined,
       sessionKey: "agent:main:mattermost:default:chan-1",
       parentSessionKey: undefined,
     });
   });
 
-  it("keeps direct-message sessions linear", () => {
+  it("keeps direct-message sessions linear when their effective mode is off", () => {
     expect(
       resolveMattermostThreadSessionContext({
         baseSessionKey: "agent:main:mattermost:default:user-1",
         kind: "direct",
         postId: "post-123",
-        replyToMode: "all",
+        replyToMode: "off",
         threadRootId: "dm-root-456",
       }),
     ).toEqual({
@@ -612,97 +423,23 @@ describe("resolveMattermostThreadSessionContext", () => {
   });
 });
 
-describe("processMattermostReplayGuardedPost", () => {
-  it("skips duplicate message batches after a successful commit", async () => {
-    const replayGuard = createClaimableDedupe({
-      ttlMs: 10_000,
-      memoryMaxSize: 100,
-    });
-    const handlePost = vi.fn(async () => undefined);
-
-    await expect(
-      processMattermostReplayGuardedPost({
-        replayGuard,
-        accountId: "acct",
-        messageIds: ["post-1"],
-        handlePost,
+describe("resolveMattermostPendingHistoryKey", () => {
+  it("does not retain pending history buckets for flat direct messages", () => {
+    expect(
+      resolveMattermostPendingHistoryKey({
+        kind: "direct",
+        sessionKey: "agent:main:mattermost:direct:user-1",
       }),
-    ).resolves.toBe("processed");
-    await expect(
-      processMattermostReplayGuardedPost({
-        replayGuard,
-        accountId: "acct",
-        messageIds: ["post-1"],
-        handlePost,
-      }),
-    ).resolves.toBe("duplicate");
-
-    expect(handlePost).toHaveBeenCalledTimes(1);
+    ).toBeNull();
   });
 
-  it("releases claims for explicit retryable failures", async () => {
-    const replayGuard = createClaimableDedupe({
-      ttlMs: 10_000,
-      memoryMaxSize: 100,
-    });
-    let attempts = 0;
-    const handlePost = vi.fn(async () => {
-      attempts += 1;
-      if (attempts === 1) {
-        throw new MattermostRetryableInboundError("retry me");
-      }
-    });
-
-    await expect(
-      processMattermostReplayGuardedPost({
-        replayGuard,
-        accountId: "acct",
-        messageIds: ["post-2"],
-        handlePost,
+  it("keeps pending room history scoped to the active session", () => {
+    expect(
+      resolveMattermostPendingHistoryKey({
+        kind: "channel",
+        sessionKey: "agent:main:mattermost:channel:chan-1:thread:post-123",
       }),
-    ).rejects.toThrow("retry me");
-    await expect(
-      processMattermostReplayGuardedPost({
-        replayGuard,
-        accountId: "acct",
-        messageIds: ["post-2"],
-        handlePost,
-      }),
-    ).resolves.toBe("processed");
-
-    expect(handlePost).toHaveBeenCalledTimes(2);
-  });
-
-  it("keeps replay committed after a non-retryable failure", async () => {
-    const replayGuard = createClaimableDedupe({
-      ttlMs: 10_000,
-      memoryMaxSize: 100,
-    });
-    const visibleSideEffect = vi.fn();
-    const handlePost = vi.fn(async () => {
-      visibleSideEffect();
-      throw new Error("post-send failure");
-    });
-
-    await expect(
-      processMattermostReplayGuardedPost({
-        replayGuard,
-        accountId: "acct",
-        messageIds: ["post-3"],
-        handlePost,
-      }),
-    ).rejects.toThrow("post-send failure");
-    await expect(
-      processMattermostReplayGuardedPost({
-        replayGuard,
-        accountId: "acct",
-        messageIds: ["post-3"],
-        handlePost,
-      }),
-    ).resolves.toBe("duplicate");
-
-    expect(handlePost).toHaveBeenCalledTimes(1);
-    expect(visibleSideEffect).toHaveBeenCalledTimes(1);
+    ).toBe("agent:main:mattermost:channel:chan-1:thread:post-123");
   });
 });
 

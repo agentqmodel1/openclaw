@@ -1,8 +1,9 @@
+import { uniqueStrings } from "openclaw/plugin-sdk/string-coerce-runtime";
 import type { PendingApproval, TlonSettingsStore } from "../settings.js";
 import { normalizeShip } from "../targets.js";
 import type { TlonResolvedAccount } from "../types.js";
 
-export type TlonMonitorSettingsState = {
+type TlonMonitorSettingsState = {
   effectiveDmAllowlist: string[];
   effectiveShowModelSig: boolean;
   effectiveAutoAcceptDmInvites: boolean;
@@ -17,43 +18,18 @@ export type TlonMonitorSettingsState = {
 export function buildTlonSettingsMigrations(
   account: TlonResolvedAccount,
   currentSettings: TlonSettingsStore,
-): Array<{ key: string; fileValue: unknown; settingsValue: unknown }> {
+): Array<{ key: keyof TlonSettingsStore; fileValue: unknown; settingsValue: unknown }> {
+  const keys = [
+    "dmAllowlist",
+    "groupInviteAllowlist",
+    "groupChannels",
+    "defaultAuthorizedShips",
+    "autoDiscoverChannels",
+    "autoAcceptDmInvites",
+    "autoAcceptGroupInvites",
+  ] as const;
   return [
-    {
-      key: "dmAllowlist",
-      fileValue: account.dmAllowlist,
-      settingsValue: currentSettings.dmAllowlist,
-    },
-    {
-      key: "groupInviteAllowlist",
-      fileValue: account.groupInviteAllowlist,
-      settingsValue: currentSettings.groupInviteAllowlist,
-    },
-    {
-      key: "groupChannels",
-      fileValue: account.groupChannels,
-      settingsValue: currentSettings.groupChannels,
-    },
-    {
-      key: "defaultAuthorizedShips",
-      fileValue: account.defaultAuthorizedShips,
-      settingsValue: currentSettings.defaultAuthorizedShips,
-    },
-    {
-      key: "autoDiscoverChannels",
-      fileValue: account.autoDiscoverChannels,
-      settingsValue: currentSettings.autoDiscoverChannels,
-    },
-    {
-      key: "autoAcceptDmInvites",
-      fileValue: account.autoAcceptDmInvites,
-      settingsValue: currentSettings.autoAcceptDmInvites,
-    },
-    {
-      key: "autoAcceptGroupInvites",
-      fileValue: account.autoAcceptGroupInvites,
-      settingsValue: currentSettings.autoAcceptGroupInvites,
-    },
+    ...keys.map((key) => ({ key, fileValue: account[key], settingsValue: currentSettings[key] })),
     {
       key: "showModelSig",
       fileValue: account.showModelSignature,
@@ -145,14 +121,5 @@ export function applyTlonSettingsOverrides(params: {
 }
 
 export function mergeUniqueStrings(base: string[], next?: string[]): string[] {
-  if (!next?.length) {
-    return [...base];
-  }
-  const merged = [...base];
-  for (const value of next) {
-    if (!merged.includes(value)) {
-      merged.push(value);
-    }
-  }
-  return merged;
+  return uniqueStrings([...base, ...(next ?? [])]);
 }

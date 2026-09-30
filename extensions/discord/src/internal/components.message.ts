@@ -45,8 +45,8 @@ export abstract class Button extends BaseButton {
 export abstract class LinkButton extends BaseButton {
   customId = "";
   abstract url: string;
-  style = ButtonStyle.Link;
-  async run(): Promise<never> {
+  override style = ButtonStyle.Link;
+  override async run(): Promise<never> {
     throw new Error("Link buttons do not run handlers");
   }
   serialize(): APIButtonComponent {
@@ -67,7 +67,10 @@ export abstract class AnySelectMenu extends BaseMessageInteractiveComponent {
   maxValues?: number;
   disabled = false;
   required?: boolean;
-  abstract serializeOptions(): Record<string, unknown>;
+  defaultValues?: unknown[];
+  serializeOptions(): Record<string, unknown> {
+    return { type: this.type, default_values: this.defaultValues };
+  }
   serialize() {
     return clean({
       ...this.serializeOptions(),
@@ -84,40 +87,27 @@ export abstract class AnySelectMenu extends BaseMessageInteractiveComponent {
 export abstract class StringSelectMenu extends AnySelectMenu {
   readonly type = ComponentType.StringSelect;
   abstract options: APIStringSelectComponent["options"];
-  serializeOptions() {
+  override serializeOptions() {
     return { type: this.type, options: this.options };
   }
 }
 
 export abstract class UserSelectMenu extends AnySelectMenu {
   readonly type = ComponentType.UserSelect;
-  defaultValues?: unknown[];
-  serializeOptions() {
-    return { type: this.type, default_values: this.defaultValues };
-  }
 }
 
 export abstract class RoleSelectMenu extends AnySelectMenu {
   readonly type = ComponentType.RoleSelect;
-  defaultValues?: unknown[];
-  serializeOptions() {
-    return { type: this.type, default_values: this.defaultValues };
-  }
 }
 
 export abstract class MentionableSelectMenu extends AnySelectMenu {
   readonly type = ComponentType.MentionableSelect;
-  defaultValues?: unknown[];
-  serializeOptions() {
-    return { type: this.type, default_values: this.defaultValues };
-  }
 }
 
 export abstract class ChannelSelectMenu extends AnySelectMenu {
   readonly type = ComponentType.ChannelSelect;
   channelTypes?: APIChannelSelectComponent["channel_types"];
-  defaultValues?: unknown[];
-  serializeOptions() {
+  override serializeOptions() {
     return {
       type: this.type,
       default_values: this.defaultValues,
@@ -128,7 +118,7 @@ export abstract class ChannelSelectMenu extends AnySelectMenu {
 
 export class Row<T extends BaseMessageInteractiveComponent> extends BaseComponent {
   readonly type = ComponentType.ActionRow;
-  readonly isV2 = false;
+  override readonly isV2 = false;
   components: T[];
   constructor(components: T[] = []) {
     super();
@@ -136,12 +126,6 @@ export class Row<T extends BaseMessageInteractiveComponent> extends BaseComponen
   }
   addComponent(component: T): void {
     this.components.push(component);
-  }
-  removeComponent(component: T): void {
-    this.components = this.components.filter((entry) => entry !== component);
-  }
-  removeAllComponents(): void {
-    this.components = [];
   }
   serialize(): APIActionRowComponent<APIComponentInMessageActionRow> {
     return {
@@ -155,7 +139,7 @@ export class Row<T extends BaseMessageInteractiveComponent> extends BaseComponen
 
 export class TextDisplay extends BaseComponent {
   readonly type = ComponentType.TextDisplay;
-  readonly isV2 = true;
+  override readonly isV2 = true;
   constructor(public content?: string) {
     super();
   }
@@ -166,7 +150,7 @@ export class TextDisplay extends BaseComponent {
 
 export class Separator extends BaseComponent {
   readonly type = ComponentType.Separator;
-  readonly isV2 = true;
+  override readonly isV2 = true;
   divider = true;
   spacing: 1 | 2 | "small" | "large" = "small";
   constructor(options?: { spacing?: Separator["spacing"]; divider?: boolean }) {
@@ -185,7 +169,7 @@ export class Separator extends BaseComponent {
 
 export class Thumbnail extends BaseComponent {
   readonly type = ComponentType.Thumbnail;
-  readonly isV2 = true;
+  override readonly isV2 = true;
   constructor(public url?: string) {
     super();
   }
@@ -199,7 +183,7 @@ export class Thumbnail extends BaseComponent {
 
 export class Section extends BaseComponent {
   readonly type = ComponentType.Section;
-  readonly isV2 = true;
+  override readonly isV2 = true;
   constructor(
     public components: TextDisplay[] = [],
     public accessory?: Thumbnail | Button | LinkButton,
@@ -217,7 +201,7 @@ export class Section extends BaseComponent {
 
 export class MediaGallery extends BaseComponent {
   readonly type = ComponentType.MediaGallery;
-  readonly isV2 = true;
+  override readonly isV2 = true;
   constructor(public items: Array<{ url: string; description?: string; spoiler?: boolean }> = []) {
     super();
   }
@@ -235,7 +219,7 @@ export class MediaGallery extends BaseComponent {
 
 export class File extends BaseComponent {
   readonly type = ComponentType.File;
-  readonly isV2 = true;
+  override readonly isV2 = true;
   constructor(
     public file?: `attachment://${string}`,
     public spoiler = false,
@@ -253,7 +237,7 @@ export class File extends BaseComponent {
 
 export class Container extends BaseComponent {
   readonly type = ComponentType.Container;
-  readonly isV2 = true;
+  override readonly isV2 = true;
   components: Array<
     Row<BaseMessageInteractiveComponent> | TextDisplay | Section | MediaGallery | Separator | File
   >;

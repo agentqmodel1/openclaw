@@ -1,59 +1,79 @@
+// Legacy channel config migration for thread session spawning.
 import {
   defineLegacyConfigMigration,
   getRecord,
   type LegacyConfigMigrationSpec,
   type LegacyConfigRule,
 } from "../../../config/legacy.shared.js";
+import { visitChannelEntries } from "./legacy-config-record-shared.js";
 
-function hasOwnKey(target: Record<string, unknown>, key: string): boolean {
-  return Object.prototype.hasOwnProperty.call(target, key);
-}
-
-function hasLegacyThreadBindingTtl(value: unknown): boolean {
+function hasLegacyThreadBindingSpawnSplit(value: unknown): boolean {
   const threadBindings = getRecord(value);
-  return Boolean(threadBindings && hasOwnKey(threadBindings, "ttlHours"));
-}
-
-function hasLegacyThreadBindingTtlInAccounts(value: unknown): boolean {
-  const accounts = getRecord(value);
-  if (!accounts) {
-    return false;
-  }
-  return Object.values(accounts).some((entry) =>
-    hasLegacyThreadBindingTtl(getRecord(entry)?.threadBindings),
+  return Boolean(
+    threadBindings &&
+    (Object.hasOwn(threadBindings, "spawnSubagentSessions") ||
+      Object.hasOwn(threadBindings, "spawnAcpSessions")),
   );
 }
 
-function migrateThreadBindingsTtlHoursForPath(params: {
+type ThreadBindingMigrationParams = {
   owner: Record<string, unknown>;
   pathPrefix: string;
   changes: string[];
-}): boolean {
+};
+
+function resolveMigratedSpawnSessions(
+  threadBindings: Record<string, unknown>,
+): boolean | undefined {
+  const subagent = threadBindings.spawnSubagentSessions;
+  const acp = threadBindings.spawnAcpSessions;
+  const subagentBool = typeof subagent === "boolean" ? subagent : undefined;
+  const acpBool = typeof acp === "boolean" ? acp : undefined;
+  if (subagentBool === undefined) {
+    return acpBool;
+  }
+  if (acpBool === undefined) {
+    return subagentBool;
+  }
+  return subagentBool && acpBool;
+}
+
+function migrateThreadBindingsSpawnSessionsForPath(params: ThreadBindingMigrationParams): void {
   const threadBindings = getRecord(params.owner.threadBindings);
-  if (!threadBindings || !hasOwnKey(threadBindings, "ttlHours")) {
-    return false;
+  if (!threadBindings || !hasLegacyThreadBindingSpawnSplit(threadBindings)) {
+    return;
   }
 
-  const hadIdleHours = threadBindings.idleHours !== undefined;
-  if (!hadIdleHours) {
-    threadBindings.idleHours = threadBindings.ttlHours;
+  const hadSpawnSessions = threadBindings.spawnSessions !== undefined;
+  const resolved = resolveMigratedSpawnSessions(threadBindings);
+  const oldSubagent = threadBindings.spawnSubagentSessions;
+  const oldAcp = threadBindings.spawnAcpSessions;
+  delete threadBindings.spawnSubagentSessions;
+  delete threadBindings.spawnAcpSessions;
+  if (!hadSpawnSessions && resolved !== undefined) {
+    threadBindings.spawnSessions = resolved;
   }
-  delete threadBindings.ttlHours;
-  params.owner.threadBindings = threadBindings;
 
-  if (hadIdleHours) {
+  if (hadSpawnSessions) {
     params.changes.push(
-      `Removed ${params.pathPrefix}.threadBindings.ttlHours (${params.pathPrefix}.threadBindings.idleHours already set).`,
+      `Removed deprecated ${params.pathPrefix}.threadBindings.spawnSubagentSessions/spawnAcpSessions (${params.pathPrefix}.threadBindings.spawnSessions already set).`,
+    );
+  } else if (
+    typeof oldSubagent === "boolean" &&
+    typeof oldAcp === "boolean" &&
+    oldSubagent !== oldAcp
+  ) {
+    params.changes.push(
+      `Collapsed conflicting ${params.pathPrefix}.threadBindings.spawnSubagentSessions/spawnAcpSessions → ${params.pathPrefix}.threadBindings.spawnSessions (${String(resolved)}).`,
     );
   } else {
     params.changes.push(
-      `Moved ${params.pathPrefix}.threadBindings.ttlHours → ${params.pathPrefix}.threadBindings.idleHours.`,
+      `Moved ${params.pathPrefix}.threadBindings.spawnSubagentSessions/spawnAcpSessions → ${params.pathPrefix}.threadBindings.spawnSessions (${String(resolved)}).`,
     );
   }
-  return true;
 }
 
-function hasLegacyThreadBindingTtlInAnyChannel(value: unknown): boolean {
+function hasLegacyThreadBindingInAnyChannel(value: unknown): boolean {
   const channels = getRecord(value);
   if (!channels) {
     return false;
@@ -64,8 +84,10 @@ function hasLegacyThreadBindingTtlInAnyChannel(value: unknown): boolean {
       return false;
     }
     return (
-      hasLegacyThreadBindingTtl(channel.threadBindings) ||
-      hasLegacyThreadBindingTtlInAccounts(channel.accounts)
+      hasLegacyThreadBindingSpawnSplit(channel.threadBindings) ||
+      Object.values(getRecord(channel.accounts) ?? {}).some((account) =>
+        hasLegacyThreadBindingSpawnSplit(getRecord(account)?.threadBindings),
+      )
     );
   });
 }
@@ -74,32 +96,31 @@ const THREAD_BINDING_RULES: LegacyConfigRule[] = [
   {
     path: ["session", "threadBindings"],
     message:
-      'session.threadBindings.ttlHours was renamed to session.threadBindings.idleHours. Run "openclaw doctor --fix".',
-    match: (value) => hasLegacyThreadBindingTtl(value),
+      'session.threadBindings.spawnSubagentSessions/spawnAcpSessions were replaced by session.threadBindings.spawnSessions. Run "openclaw doctor --fix".',
+    match: hasLegacyThreadBindingSpawnSplit,
   },
   {
     path: ["channels"],
     message:
-      'channels.<id>.threadBindings.ttlHours was renamed to channels.<id>.threadBindings.idleHours. Run "openclaw doctor --fix".',
-    match: (value) => hasLegacyThreadBindingTtlInAnyChannel(value),
+      'channels.<id>.threadBindings.spawnSubagentSessions/spawnAcpSessions were replaced by channels.<id>.threadBindings.spawnSessions. Run "openclaw doctor --fix".',
+    match: hasLegacyThreadBindingInAnyChannel,
   },
 ];
 
+/** Legacy config migration specs for channel-owned compatibility keys. */
 export const LEGACY_CONFIG_MIGRATIONS_CHANNELS: LegacyConfigMigrationSpec[] = [
   defineLegacyConfigMigration({
-    id: "thread-bindings.ttlHours->idleHours",
-    describe:
-      "Move legacy threadBindings.ttlHours keys to threadBindings.idleHours (session + channel configs)",
+    id: "thread-bindings.spawn-sessions",
+    describe: "Consolidate thread session spawning flags (session + channel configs)",
     legacyRules: THREAD_BINDING_RULES,
     apply: (raw, changes) => {
       const session = getRecord(raw.session);
       if (session) {
-        migrateThreadBindingsTtlHoursForPath({
+        migrateThreadBindingsSpawnSessionsForPath({
           owner: session,
           pathPrefix: "session",
           changes,
         });
-        raw.session = session;
       }
 
       const channels = getRecord(raw.channels);
@@ -107,36 +128,11 @@ export const LEGACY_CONFIG_MIGRATIONS_CHANNELS: LegacyConfigMigrationSpec[] = [
         return;
       }
 
-      for (const [channelId, channelRaw] of Object.entries(channels)) {
-        const channel = getRecord(channelRaw);
-        if (!channel) {
-          continue;
-        }
-        migrateThreadBindingsTtlHoursForPath({
-          owner: channel,
-          pathPrefix: `channels.${channelId}`,
-          changes,
+      for (const channelId of Object.keys(channels)) {
+        visitChannelEntries(raw, channelId, (owner, pathPrefix) => {
+          migrateThreadBindingsSpawnSessionsForPath({ owner, pathPrefix, changes });
         });
-
-        const accounts = getRecord(channel.accounts);
-        if (accounts) {
-          for (const [accountId, accountRaw] of Object.entries(accounts)) {
-            const account = getRecord(accountRaw);
-            if (!account) {
-              continue;
-            }
-            migrateThreadBindingsTtlHoursForPath({
-              owner: account,
-              pathPrefix: `channels.${channelId}.accounts.${accountId}`,
-              changes,
-            });
-            accounts[accountId] = account;
-          }
-          channel.accounts = accounts;
-        }
-        channels[channelId] = channel;
       }
-      raw.channels = channels;
     },
   }),
 ];

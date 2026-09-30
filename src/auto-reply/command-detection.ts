@@ -1,31 +1,21 @@
-import type { OpenClawConfig } from "../config/types.js";
+/** Command detectors used by inbound authorization and control-command routing. */
 import {
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalLowercaseString,
-} from "../shared/string-coerce.js";
+} from "@openclaw/normalization-core/string-coerce";
+import type { OpenClawConfig } from "../config/types.js";
+import { matchPluginCommand } from "../plugins/commands.js";
 import { listChatCommands, listChatCommandsForConfig } from "./commands-registry-list.js";
 import { normalizeCommandBody } from "./commands-registry-normalize.js";
 import type { CommandNormalizeOptions } from "./commands-registry.types.js";
-import { isAbortTrigger } from "./reply/abort-primitives.js";
+import { isAbortTrigger } from "./reply/abort-trigger-text.js";
 import { stripInboundMetadata } from "./reply/strip-inbound-meta.js";
 
-export function hasControlCommand(
-  text?: string,
-  cfg?: OpenClawConfig,
-  options?: CommandNormalizeOptions,
-): boolean {
-  if (!text) {
-    return false;
-  }
-  const trimmed = text.trim();
-  if (!trimmed) {
-    return false;
-  }
-  const stripped = stripInboundMetadata(trimmed);
-  if (!stripped) {
-    return false;
-  }
-  const normalizedBody = normalizeCommandBody(stripped, options);
+function normalizeControlCommandBody(text?: string, options?: CommandNormalizeOptions): string {
+  return normalizeCommandBody(stripInboundMetadata(text?.trim() ?? ""), options);
+}
+
+function hasNormalizedControlCommand(normalizedBody: string, cfg?: OpenClawConfig): boolean {
   if (!normalizedBody) {
     return false;
   }
@@ -51,25 +41,37 @@ export function hasControlCommand(
   return false;
 }
 
+/** Returns true when text starts with a configured control command alias. */
+export function hasControlCommand(
+  text?: string,
+  cfg?: OpenClawConfig,
+  options?: CommandNormalizeOptions,
+): boolean {
+  return hasNormalizedControlCommand(normalizeControlCommandBody(text, options), cfg);
+}
+
+/** Returns true for exact control commands or abort triggers after metadata stripping. */
 export function isControlCommandMessage(
   text?: string,
   cfg?: OpenClawConfig,
   options?: CommandNormalizeOptions,
 ): boolean {
-  if (!text) {
-    return false;
-  }
-  const trimmed = text.trim();
-  if (!trimmed) {
-    return false;
-  }
-  if (hasControlCommand(trimmed, cfg, options)) {
-    return true;
-  }
-  const stripped = stripInboundMetadata(trimmed);
-  const normalized =
-    normalizeOptionalLowercaseString(normalizeCommandBody(stripped, options)) ?? "";
-  return isAbortTrigger(normalized);
+  const normalizedBody = normalizeControlCommandBody(text, options);
+  return (
+    hasNormalizedControlCommand(normalizedBody, cfg) ||
+    isAbortTrigger(normalizeLowercaseStringOrEmpty(normalizedBody))
+  );
+}
+
+/** Returns true when a command starts a new transcript rather than resetting in place. */
+export function isSessionBoundaryCommandText(
+  text?: string,
+  options?: CommandNormalizeOptions,
+): boolean {
+  const normalized = normalizeControlCommandBody(text, options);
+  return (
+    /^\/(?:new|reset)(?:\s|$)/i.test(normalized) && !/^\/reset\s+soft(?:\s|$)/i.test(normalized)
+  );
 }
 
 /**
@@ -87,10 +89,22 @@ export function hasInlineCommandTokens(text?: string): boolean {
   return /(?:^|\s)[/!][a-z]/i.test(body);
 }
 
+function hasSpacedPluginCommand(text?: string): boolean {
+  const commandBody = text?.match(/(?:^|\s)(\/\s+[a-z][\s\S]*)/i)?.[1];
+  // Only active registered commands affect ingress authorization and mention gating.
+  // This keeps spaced syntax aligned with canonical `/name` command ownership.
+  return commandBody ? matchPluginCommand(commandBody) !== null : false;
+}
+
+/** Returns true when a message may need command authorization metadata. */
 export function shouldComputeCommandAuthorized(
   text?: string,
   cfg?: OpenClawConfig,
   options?: CommandNormalizeOptions,
 ): boolean {
-  return isControlCommandMessage(text, cfg, options) || hasInlineCommandTokens(text);
+  return (
+    isControlCommandMessage(text, cfg, options) ||
+    hasInlineCommandTokens(text) ||
+    hasSpacedPluginCommand(text)
+  );
 }

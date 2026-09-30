@@ -1,23 +1,23 @@
-import fs from "node:fs/promises";
 import path from "node:path";
-import type { OpenClawConfig } from "openclaw/plugin-sdk/config-types";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import {
   resolveMemoryDeepDreamingConfig,
   resolveMemoryRemDreamingConfig,
 } from "openclaw/plugin-sdk/memory-core-host-status";
+import { DAILY_MEMORY_FILENAME_RE } from "./dreaming-ingestion-state.js";
 import {
   filterRecallEntriesWithinLookback,
   previewRemDreaming,
   type RemDreamingPreview,
 } from "./dreaming-phases.js";
+import { listWorkspaceDirectory } from "./memory-workspace-files.js";
 import { previewGroundedRemMarkdown, type GroundedRemPreviewResult } from "./rem-evidence.js";
 import {
+  filterLiveShortTermRecallEntries,
   rankShortTermPromotionCandidates,
   readShortTermRecallEntries,
   type PromotionCandidate,
 } from "./short-term-promotion.js";
-
-const DAILY_MEMORY_FILE_NAME_RE = /^\d{4}-\d{2}-\d{2}\.md$/i;
 
 type MemoryRemHarnessRemConfig = ReturnType<typeof resolveMemoryRemDreamingConfig>;
 type MemoryRemHarnessDeepConfig = ReturnType<typeof resolveMemoryDeepDreamingConfig>;
@@ -82,11 +82,11 @@ function createSkippedRemPreview(): RemDreamingPreview {
 
 async function listWorkspaceDailyFiles(workspaceDir: string, limit?: number): Promise<string[]> {
   const memoryDir = path.join(workspaceDir, "memory");
-  let entries: string[] = [];
+  let entries: string[];
   try {
-    const dirEntries = await fs.readdir(memoryDir, { withFileTypes: true });
+    const dirEntries = await listWorkspaceDirectory(workspaceDir, memoryDir);
     entries = dirEntries
-      .filter((entry) => entry.isFile() && DAILY_MEMORY_FILE_NAME_RE.test(entry.name))
+      .filter((entry) => entry.isFile() && DAILY_MEMORY_FILENAME_RE.test(entry.name))
       .map((entry) => entry.name);
   } catch (err) {
     if ((err as NodeJS.ErrnoException | undefined)?.code === "ENOENT") {
@@ -130,10 +130,13 @@ export async function previewRemHarness(
     workspaceDir: params.workspaceDir,
     nowMs,
   });
-  const recallEntries = filterRecallEntriesWithinLookback({
-    entries: allRecallEntries,
-    nowMs,
-    lookbackDays: remConfig.lookbackDays,
+  const recallEntries = await filterLiveShortTermRecallEntries({
+    workspaceDir: params.workspaceDir,
+    entries: filterRecallEntriesWithinLookback({
+      entries: allRecallEntries,
+      nowMs,
+      lookbackDays: remConfig.lookbackDays,
+    }),
   });
   const remPreviewLimit = resolveRemPreviewLimit(remConfig.limit, params.remPreviewLimit);
   const remSkipped = remConfig.limit <= 0 || remPreviewLimit <= 0;

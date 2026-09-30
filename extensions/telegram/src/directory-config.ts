@@ -1,6 +1,6 @@
 import { normalizeAccountId } from "openclaw/plugin-sdk/account-core";
 import { mapAllowFromEntries } from "openclaw/plugin-sdk/channel-config-helpers";
-import type { OpenClawConfig, TelegramAccountConfig } from "openclaw/plugin-sdk/config-types";
+import type { OpenClawConfig, TelegramAccountConfig } from "openclaw/plugin-sdk/config-contracts";
 import { createResolvedDirectoryEntriesLister } from "openclaw/plugin-sdk/directory-config-runtime";
 import { mergeTelegramAccountConfig } from "./account-config.js";
 import { resolveDefaultTelegramAccountSelection } from "./account-selection.js";
@@ -24,7 +24,7 @@ function resolveTelegramDirectoryAccount(
 export const listTelegramDirectoryPeersFromConfig =
   createResolvedDirectoryEntriesLister<TelegramDirectoryAccount>({
     kind: "user",
-    resolveAccount: (cfg, accountId) => resolveTelegramDirectoryAccount(cfg, accountId),
+    resolveAccount: resolveTelegramDirectoryAccount,
     resolveSources: (account) => [
       mapAllowFromEntries(account.config.allowFrom),
       Object.keys(account.config.dms ?? {}),
@@ -44,7 +44,7 @@ export const listTelegramDirectoryPeersFromConfig =
 export const listTelegramDirectoryGroupsFromConfig =
   createResolvedDirectoryEntriesLister<TelegramDirectoryAccount>({
     kind: "group",
-    resolveAccount: (cfg, accountId) => resolveTelegramDirectoryAccount(cfg, accountId),
+    resolveAccount: resolveTelegramDirectoryAccount,
     resolveSources: (account) => [Object.keys(account.config.groups ?? {})],
     normalizeId: (entry) => entry.trim() || null,
   });

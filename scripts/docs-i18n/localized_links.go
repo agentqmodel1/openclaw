@@ -30,7 +30,7 @@ type docsRedirect struct {
 var (
 	localeDirRe             = regexp.MustCompile(`^[a-z]{2,3}(?:-[A-Za-z0-9]{2,8})?$`)
 	fencedBacktickCodeBlock = regexp.MustCompile("(?ms)(^|\\n)[ \\t]*```[^\\n]*\\n.*?\\n[ \\t]*```[ \\t]*(?:\\n|$)")
-	fencedTildeCodeBlock    = regexp.MustCompile("(?ms)(^|\\n)[ \\t]*~~~[^\\n]*\\n.*?\\n[ \\t]*~~~[ \\t]*(?:\\n|$)")
+	fencedTildeCodeBlock    = regexp.MustCompile(`(?ms)(^|\n)[ \t]*~~~[^\n]*\n.*?\n[ \t]*~~~[ \t]*(?:\n|$)`)
 	markdownLinkTargetRe    = regexp.MustCompile(`!?\[[^\]]*\]\(([^)]+)\)`)
 	hrefDoubleQuotedValueRe = regexp.MustCompile(`\bhref\s*=\s*"([^"]*)"`)
 	hrefSingleQuotedValueRe = regexp.MustCompile(`\bhref\s*=\s*'([^']*)'`)
@@ -153,11 +153,8 @@ func normalizeSlashes(path string) string {
 }
 
 func firstPathSegment(relPath string) string {
-	if relPath == "" {
-		return ""
-	}
-	parts := strings.SplitN(relPath, "/", 2)
-	return parts[0]
+	segment, _, _ := strings.Cut(relPath, "/")
+	return segment
 }
 
 func addRouteCandidates(routes map[string]struct{}, relPath string, permalinks []string) {
@@ -230,64 +227,22 @@ func (ri *routeIndex) localizeBodyLinks(body string) string {
 	masked = maskMatches(masked, fencedTildeCodeBlock, state.Next, &placeholders, mapping)
 	masked = maskMatches(masked, inlineCodeRe, state.Next, &placeholders, mapping)
 
-	masked = rewriteMarkdownLinkTargets(masked, ri)
-	masked = rewriteHrefTargets(masked, ri)
+	masked = rewriteCapturedTargets(masked, markdownLinkTargetRe, ri, true)
+	masked = rewriteCapturedTargets(masked, hrefDoubleQuotedValueRe, ri, false)
+	masked = rewriteCapturedTargets(masked, hrefSingleQuotedValueRe, ri, false)
 
 	return unmaskMarkdown(masked, placeholders, mapping)
 }
 
-func rewriteMarkdownLinkTargets(text string, ri *routeIndex) string {
-	matches := markdownLinkTargetRe.FindAllStringSubmatchIndex(text, -1)
-	if len(matches) == 0 {
-		return text
-	}
-
-	var out strings.Builder
-	pos := 0
-	for _, span := range matches {
-		fullStart, targetStart, targetEnd := span[0], span[2], span[3]
-		if fullStart < pos {
-			continue
+func rewriteCapturedTargets(text string, re *regexp.Regexp, ri *routeIndex, skipImages bool) string {
+	return re.ReplaceAllStringFunc(text, func(match string) string {
+		if skipImages && strings.HasPrefix(match, "!") {
+			return match
 		}
-
-		out.WriteString(text[pos:targetStart])
-		target := text[targetStart:targetEnd]
-		if text[fullStart] == '!' {
-			out.WriteString(target)
-		} else {
-			out.WriteString(ri.localizeURL(target))
-		}
-		pos = targetEnd
-	}
-	out.WriteString(text[pos:])
-	return out.String()
-}
-
-func rewriteHrefTargets(text string, ri *routeIndex) string {
-	text = rewriteCapturedTargets(text, hrefDoubleQuotedValueRe, 2, ri)
-	text = rewriteCapturedTargets(text, hrefSingleQuotedValueRe, 2, ri)
-	return text
-}
-
-func rewriteCapturedTargets(text string, re *regexp.Regexp, groupIndex int, ri *routeIndex) string {
-	matches := re.FindAllStringSubmatchIndex(text, -1)
-	if len(matches) == 0 {
-		return text
-	}
-
-	var out strings.Builder
-	pos := 0
-	for _, span := range matches {
-		start, end := span[groupIndex], span[groupIndex+1]
-		if start < pos || start < 0 || end < 0 {
-			continue
-		}
-		out.WriteString(text[pos:start])
-		out.WriteString(ri.localizeURL(text[start:end]))
-		pos = end
-	}
-	out.WriteString(text[pos:])
-	return out.String()
+		span := re.FindStringSubmatchIndex(match)
+		start, end := span[2], span[3]
+		return match[:start] + ri.localizeURL(match[start:end]) + match[end:]
+	})
 }
 
 func (ri *routeIndex) localizeURL(raw string) string {
@@ -325,15 +280,22 @@ func (ri *routeIndex) localizeURL(raw string) string {
 
 func hasURLScheme(raw string) bool {
 	switch {
-	case strings.HasPrefix(raw, "http://"), strings.HasPrefix(raw, "https://"):
+	case hasSchemePrefix(raw, "http://"), hasSchemePrefix(raw, "https://"):
 		return true
-	case strings.HasPrefix(raw, "mailto:"), strings.HasPrefix(raw, "tel:"):
+	case hasSchemePrefix(raw, "mailto:"), hasSchemePrefix(raw, "tel:"):
 		return true
-	case strings.HasPrefix(raw, "data:"), strings.HasPrefix(raw, "javascript:"):
+	case hasSchemePrefix(raw, "data:"), hasSchemePrefix(raw, "javascript:"), hasSchemePrefix(raw, "vbscript:"):
 		return true
 	default:
 		return false
 	}
+}
+
+func hasSchemePrefix(raw, prefix string) bool {
+	if len(raw) < len(prefix) {
+		return false
+	}
+	return strings.EqualFold(raw[:len(prefix)], prefix)
 }
 
 func splitURLSuffix(raw string) (string, string) {
@@ -352,12 +314,7 @@ func prefixLocaleRoute(lang, route string) string {
 }
 
 func (ri *routeIndex) routeHasLocalePrefix(route string) bool {
-	if route == "/" {
-		return false
-	}
-	firstSegment := strings.TrimPrefix(route, "/")
-	firstSegment = strings.SplitN(firstSegment, "/", 2)[0]
-	return ri.isLocalePrefix(firstSegment)
+	return ri.isLocalePrefix(firstPathSegment(strings.TrimPrefix(route, "/")))
 }
 
 func (ri *routeIndex) isLocalePrefix(segment string) bool {

@@ -1,4 +1,4 @@
-export type LaneDeliverySnapshot = {
+type LaneDeliverySnapshot = {
   delivered: boolean;
   skippedNonSilent: number;
   failedNonSilent: number;

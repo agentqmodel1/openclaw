@@ -1,34 +1,102 @@
+/** Loads bundled channel plugin runtime entries and setup metadata. */
+import path from "node:path";
+import { isVitestRuntimeEnv } from "../infra/env.js";
 import {
-  listBundledPluginMetadata,
   resolveBundledPluginGeneratedPath,
-  resolveBundledPluginWorkspaceSourcePath,
-  type BundledPluginMetadata,
-} from "./bundled-plugin-metadata.js";
+  type BundledPluginPathPair,
+} from "./bundled-plugin-scan.js";
+import type { PluginManifestRecord } from "./manifest-registry.js";
+import type { OpenClawPackageManifest } from "./manifest.js";
+import { pluginCacheExistsSync } from "./plugin-cache-files.js";
+import { resolvePluginMetadataSnapshot } from "./plugin-metadata-snapshot.js";
 
-export type BundledChannelPluginMetadata = BundledPluginMetadata;
+export { resolveBundledPluginGeneratedPath as resolveBundledChannelGeneratedPath };
 
+type BundledMetadataScope =
+  | { kind: "default" }
+  | { kind: "empty" }
+  | { kind: "env"; env: NodeJS.ProcessEnv };
+
+/** Bundled channel plugin metadata used by generators and runtime path resolvers. */
+export type BundledChannelPluginMetadata = {
+  dirName: string;
+  source: BundledPluginPathPair;
+  setupSource?: BundledPluginPathPair;
+  manifest: {
+    id: string;
+    channels?: readonly string[];
+  };
+  packageManifest?: OpenClawPackageManifest;
+  rootDir: string;
+};
+
+function resolveBundledMetadataScope(params?: {
+  rootDir?: string;
+  scanDir?: string;
+}): BundledMetadataScope {
+  const overrideDir = params?.scanDir
+    ? path.resolve(params.scanDir)
+    : params?.rootDir
+      ? resolveBundledPluginsDirForRoot(params.rootDir)
+      : undefined;
+  if (!overrideDir) {
+    return params?.rootDir ? { kind: "empty" } : { kind: "default" };
+  }
+  if (!pluginCacheExistsSync(overrideDir)) {
+    return { kind: "empty" };
+  }
+  return {
+    kind: "env",
+    env: {
+      ...process.env,
+      OPENCLAW_BUNDLED_PLUGINS_DIR: overrideDir,
+      ...(isVitestRuntimeEnv() ? { OPENCLAW_TEST_TRUST_BUNDLED_PLUGINS_DIR: "1" } : {}),
+    },
+  };
+}
+
+function resolveBundledPluginsDirForRoot(rootDir: string): string | undefined {
+  const candidates = [
+    path.join(rootDir, "extensions"),
+    path.join(rootDir, "dist-runtime", "extensions"),
+    path.join(rootDir, "dist", "extensions"),
+  ];
+  return candidates.find((candidate) => pluginCacheExistsSync(candidate));
+}
+
+function toBundledChannelPluginMetadata(
+  record: PluginManifestRecord,
+): BundledChannelPluginMetadata | null {
+  if (record.origin !== "bundled" || !record.source) {
+    return null;
+  }
+  return {
+    dirName: path.basename(record.rootDir),
+    source: { source: record.source, built: record.source },
+    ...(record.setupSource
+      ? { setupSource: { source: record.setupSource, built: record.setupSource } }
+      : {}),
+    manifest: {
+      id: record.id,
+      channels: record.channels,
+    },
+    ...(record.packageManifest ? { packageManifest: record.packageManifest } : {}),
+    rootDir: record.rootDir,
+  };
+}
+
+/** Lists bundled channel plugin metadata from default or caller-provided scan roots. */
 export function listBundledChannelPluginMetadata(params?: {
   rootDir?: string;
   scanDir?: string;
   includeChannelConfigs?: boolean;
   includeSyntheticChannelConfigs?: boolean;
 }): readonly BundledChannelPluginMetadata[] {
-  return listBundledPluginMetadata(params);
-}
-
-export function resolveBundledChannelGeneratedPath(
-  rootDir: string,
-  entry: BundledPluginMetadata["source"] | BundledPluginMetadata["setupSource"],
-  pluginDirName?: string,
-  scanDir?: string,
-): string | null {
-  return resolveBundledPluginGeneratedPath(rootDir, entry, pluginDirName, scanDir);
-}
-
-export function resolveBundledChannelWorkspacePath(params: {
-  rootDir: string;
-  scanDir?: string;
-  pluginId: string;
-}): string | null {
-  return resolveBundledPluginWorkspaceSourcePath(params);
+  const scope = resolveBundledMetadataScope(params);
+  if (scope.kind === "empty") {
+    return [];
+  }
+  return resolvePluginMetadataSnapshot({
+    env: scope.kind === "env" ? scope.env : undefined,
+  }).plugins.flatMap((record) => toBundledChannelPluginMetadata(record) ?? []);
 }

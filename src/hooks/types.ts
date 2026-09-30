@@ -1,3 +1,5 @@
+import type { RequirementRemote, RequirementsMetadata } from "../shared/requirements.js";
+
 export type HookInstallSpec = {
   id?: string;
   kind: "bundled" | "npm" | "git";
@@ -7,7 +9,7 @@ export type HookInstallSpec = {
   bins?: string[];
 };
 
-export type OpenClawHookMetadata = {
+export type OpenClawHookMetadata = RequirementsMetadata & {
   always?: boolean;
   hookKey?: string;
   emoji?: string;
@@ -16,13 +18,6 @@ export type OpenClawHookMetadata = {
   events: string[];
   /** Optional export name (default: "default") */
   export?: string;
-  os?: string[];
-  requires?: {
-    bins?: string[];
-    anyBins?: string[];
-    env?: string[];
-    config?: string[];
-  };
   install?: HookInstallSpec[];
 };
 
@@ -51,17 +46,10 @@ export type HookEntry = {
   invocation?: HookInvocationPolicy;
 };
 
-export type HookEligibilityContext = {
-  remote?: {
-    platforms: string[];
-    hasBin: (bin: string) => boolean;
-    hasAnyBin: (bins: string[]) => boolean;
-    note?: string;
-  };
+export type HookPolicyEntry = Pick<HookEntry, "metadata"> & {
+  hook: Pick<Hook, "name" | "source">;
 };
 
-export type HookSnapshot = {
-  hooks: Array<{ name: string; events: string[] }>;
-  resolvedHooks?: Hook[];
-  version?: number;
+export type HookEligibilityContext = {
+  remote?: Required<RequirementRemote> & { note?: string };
 };

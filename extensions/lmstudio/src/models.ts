@@ -7,7 +7,20 @@ import {
   SELF_HOSTED_DEFAULT_COST,
   SELF_HOSTED_DEFAULT_MAX_TOKENS,
 } from "openclaw/plugin-sdk/provider-setup";
+import {
+  asPositiveSafeInteger,
+  normalizeOptionalLowercaseString,
+  normalizeTrimmedStringList,
+  normalizeUniqueTrimmedStringList,
+  uniqueStrings,
+} from "openclaw/plugin-sdk/string-coerce-runtime";
 import { LMSTUDIO_DEFAULT_BASE_URL, LMSTUDIO_DEFAULT_LOAD_CONTEXT_LENGTH } from "./defaults.js";
+import {
+  buildLmstudioReasoningEffortMap,
+  LMSTUDIO_OPENAI_COMPAT_ENABLED_REASONING_EFFORTS,
+  LMSTUDIO_OPENAI_COMPAT_REASONING_EFFORTS,
+  normalizeLmstudioTransportReasoningCompat,
+} from "./model-reasoning.js";
 
 export type LmstudioModelWire = {
   type?: "llm" | "embedding";
@@ -15,6 +28,8 @@ export type LmstudioModelWire = {
   display_name?: string;
   max_context_length?: number;
   format?: "gguf" | "mlx" | null;
+  variants?: unknown;
+  selected_variant?: unknown;
   capabilities?: {
     vision?: boolean;
     trained_for_tool_use?: boolean;
@@ -43,103 +58,77 @@ type LmstudioConfiguredCatalogEntry = {
   compat?: ModelDefinitionConfig["compat"];
 };
 
-function normalizeReasoningOption(value: unknown): string | null {
-  if (typeof value !== "string") {
-    return null;
-  }
-  const normalized = value.trim().toLowerCase();
-  return normalized.length > 0 ? normalized : null;
-}
+const LMSTUDIO_CONFIGURED_BOOLEAN_COMPAT_FIELDS = [
+  "supportsStore",
+  "supportsPromptCacheKey",
+  "supportsDeveloperRole",
+  "supportsReasoningEffort",
+  "supportsTemperature",
+  "supportsUsageInStreaming",
+  "supportsTools",
+  "supportsStrictMode",
+  "supportsJsonSchemaResponseFormat",
+  "requiresStringContent",
+  "strictMessageKeys",
+  "requiresToolResultName",
+  "requiresAssistantAfterToolResult",
+  "requiresThinkingAsText",
+  "requiresReasoningContentOnAssistantMessages",
+  "requiresOpenAiAnthropicToolPayload",
+] as const satisfies readonly (keyof NonNullable<ModelDefinitionConfig["compat"]>)[];
 
-function isReasoningEnabledOption(value: unknown): boolean {
-  const normalized = normalizeReasoningOption(value);
-  if (!normalized) {
-    return false;
-  }
-  return normalized !== "off";
-}
+const LMSTUDIO_CONFIGURED_THINKING_FORMATS = [
+  "openai",
+  "openrouter",
+  "deepseek",
+  "together",
+  "qwen",
+  "qwen-chat-template",
+  "zai",
+] as const satisfies readonly NonNullable<
+  NonNullable<ModelDefinitionConfig["compat"]>["thinkingFormat"]
+>[];
 
 function normalizeReasoningOptions(value: unknown): string[] {
-  if (!Array.isArray(value)) {
-    return [];
-  }
-  return [
-    ...new Set(
-      value
-        .map((option) => normalizeReasoningOption(option))
-        .filter((option): option is string => option !== null),
-    ),
-  ];
+  return uniqueStrings(normalizeTrimmedStringList(value).map((option) => option.toLowerCase()));
 }
 
-function resolveLmstudioReasoningDefault(
-  reasoning: LmstudioReasoningCapabilityWire,
-): string | null {
-  const normalizedDefault = normalizeReasoningOption(reasoning.default);
-  return normalizedDefault && isReasoningEnabledOption(normalizedDefault)
-    ? normalizedDefault
-    : null;
-}
-
-function resolveLmstudioEnabledReasoningOption(
-  allowedOptions: readonly string[],
-  reasoning: LmstudioReasoningCapabilityWire,
-): string | undefined {
-  const normalizedDefault = resolveLmstudioReasoningDefault(reasoning);
-  if (normalizedDefault && allowedOptions.includes(normalizedDefault)) {
-    return normalizedDefault;
-  }
+function isLmstudioBinaryReasoningOptions(allowedOptions: readonly string[]): boolean {
   return (
-    allowedOptions.find((option) => option === "on" || option === "default") ??
-    allowedOptions.find((option) => isReasoningEnabledOption(option))
+    allowedOptions.some((option) => option === "on") &&
+    allowedOptions.every((option) => option === "on" || option === "off")
   );
 }
 
-function resolveLmstudioDisabledReasoningOption(
-  allowedOptions: readonly string[],
-): string | undefined {
-  return (
-    allowedOptions.find((option) => option === "off") ??
-    allowedOptions.find((option) => option === "none")
+function resolveLmstudioTransportReasoningEfforts(allowedOptions: readonly string[]): string[] {
+  if (isLmstudioBinaryReasoningOptions(allowedOptions)) {
+    return allowedOptions.includes("off")
+      ? [...LMSTUDIO_OPENAI_COMPAT_REASONING_EFFORTS]
+      : [...LMSTUDIO_OPENAI_COMPAT_ENABLED_REASONING_EFFORTS];
+  }
+  return uniqueStrings(
+    allowedOptions
+      .map((option) => (option === "off" ? "none" : option))
+      .filter((option) => option !== "on"),
   );
 }
 
 export function resolveLmstudioReasoningCompat(
   entry: Pick<LmstudioModelWire, "capabilities">,
 ): ModelDefinitionConfig["compat"] | undefined {
-  const reasoning = entry.capabilities?.reasoning;
-  if (reasoning === undefined || reasoning === null) {
+  const supportedReasoningEfforts = resolveLmstudioTransportReasoningEfforts(
+    normalizeReasoningOptions(entry.capabilities?.reasoning?.allowed_options),
+  );
+  if (!supportedReasoningEfforts.some((option) => option !== "none")) {
     return undefined;
   }
-  const allowedOptions = normalizeReasoningOptions(reasoning.allowed_options);
-  if (allowedOptions.length === 0) {
-    return undefined;
-  }
-  const enabled = resolveLmstudioEnabledReasoningOption(allowedOptions, reasoning);
-  if (!enabled) {
-    return undefined;
-  }
-  const disabled = resolveLmstudioDisabledReasoningOption(allowedOptions);
   return {
     supportsReasoningEffort: true,
-    supportedReasoningEfforts: allowedOptions,
-    reasoningEffortMap: {
-      ...(disabled ? { off: disabled, none: disabled } : {}),
-      minimal: enabled,
-      low: enabled,
-      medium: enabled,
-      high: enabled,
-      xhigh: enabled,
-      adaptive: enabled,
-      max: enabled,
-    },
+    supportedReasoningEfforts,
+    reasoningEffortMap: buildLmstudioReasoningEffortMap(supportedReasoningEfforts),
   };
 }
 
-/**
- * Resolves LM Studio reasoning support from capabilities payloads.
- * Defaults to false when the server omits reasoning metadata.
- */
 export function resolveLmstudioReasoningCapability(
   entry: Pick<LmstudioModelWire, "capabilities">,
 ): boolean {
@@ -149,9 +138,10 @@ export function resolveLmstudioReasoningCapability(
   }
   const allowedOptions = normalizeReasoningOptions(reasoning.allowed_options);
   if (allowedOptions.length > 0) {
-    return allowedOptions.some((option) => isReasoningEnabledOption(option));
+    return allowedOptions.some((option) => option !== "off");
   }
-  return isReasoningEnabledOption(reasoning.default);
+  const defaultOption = normalizeOptionalLowercaseString(reasoning.default);
+  return defaultOption !== undefined && defaultOption !== "off";
 }
 
 /**
@@ -165,34 +155,59 @@ export function resolveLoadedContextWindow(
   let contextWindow: number | null = null;
   for (const instance of loadedInstances) {
     // Discovery payload is external JSON, so tolerate malformed entries.
-    const length = instance?.config?.context_length;
-    if (length === undefined || !Number.isFinite(length) || length <= 0) {
+    const normalized = asPositiveSafeInteger(instance?.config?.context_length);
+    if (normalized === undefined) {
       continue;
     }
-    const normalized = Math.floor(length);
     contextWindow = contextWindow === null ? normalized : Math.max(contextWindow, normalized);
   }
   return contextWindow;
 }
 
 /**
- * Normalizes a server path by stripping trailing slash and inference suffixes.
+ * Resolves LM Studio variant ids back to their loadable model key.
  *
- * LM Studio users often copy their inference URL (e.g. "http://localhost:1234/v1") instead
- * of the server root. This function strips a trailing "/v1" or "/api/v1" so the caller always
- * receives a clean root base URL. The expected input is the server root without any API version
- * path (e.g. "http://localhost:1234").
+ * LM Studio exposes quantized variants separately from the canonical `key`, but
+ * `/api/v1/models/load` expects the key. Exact key matches still win so unusual
+ * servers that expose a suffix as the real key are preserved.
  */
-function normalizeUrlPath(pathname: string): string {
-  const trimmed = pathname.replace(/\/+$/, "");
-  if (!trimmed) {
-    return "";
+export function resolveLmstudioCanonicalModelKey(params: {
+  modelKey: string;
+  models: LmstudioModelWire[];
+}): string {
+  const modelKey = params.modelKey.trim();
+  if (!modelKey) {
+    return modelKey;
   }
-  return trimmed.replace(/\/api\/v1$/i, "").replace(/\/v1$/i, "");
+  const normalizedModelKey = modelKey.toLowerCase();
+  for (const entry of params.models) {
+    if (entry.key?.trim() === modelKey) {
+      return modelKey;
+    }
+  }
+  for (const entry of params.models) {
+    const key = entry.key?.trim();
+    if (!key) {
+      continue;
+    }
+    const selectedVariant =
+      typeof entry.selected_variant === "string" ? entry.selected_variant.trim() : "";
+    const variants = normalizeUniqueTrimmedStringList(entry.variants);
+    if (
+      selectedVariant.toLowerCase() === normalizedModelKey ||
+      variants.some((variant) => variant.toLowerCase() === normalizedModelKey)
+    ) {
+      return key;
+    }
+  }
+  return modelKey;
 }
 
-function hasExplicitHttpScheme(value: string): boolean {
-  return /^https?:\/\//i.test(value);
+function normalizeUrlPath(pathname: string): string {
+  return pathname
+    .replace(/\/+$/, "")
+    .replace(/\/api\/v1$/i, "")
+    .replace(/\/v1$/i, "");
 }
 
 function isLikelyHostBaseUrl(value: string): boolean {
@@ -208,11 +223,23 @@ function normalizeConfiguredReasoningEffortMap(value: unknown): Record<string, s
     return undefined;
   }
   const normalized = Object.fromEntries(
-    Object.entries(value)
-      .map(([key, mapped]) => [key.trim(), typeof mapped === "string" ? mapped.trim() : ""])
-      .filter(([key, mapped]) => key.length > 0 && mapped.length > 0),
+    Object.entries(value).flatMap(([key, mapped]) => {
+      const normalizedKey = key.trim();
+      const normalizedValue = typeof mapped === "string" ? mapped.trim() : "";
+      return normalizedKey && normalizedValue ? [[normalizedKey, normalizedValue] as const] : [];
+    }),
   );
   return Object.keys(normalized).length > 0 ? normalized : undefined;
+}
+
+function normalizeConfiguredCompatStringList(value: unknown): string[] | undefined {
+  if (
+    !Array.isArray(value) ||
+    !value.every((entry): entry is string => typeof entry === "string" && entry.length > 0)
+  ) {
+    return undefined;
+  }
+  return [...value];
 }
 
 function normalizeLmstudioConfiguredCompat(value: unknown): ModelDefinitionConfig["compat"] {
@@ -223,11 +250,34 @@ function normalizeLmstudioConfiguredCompat(value: unknown): ModelDefinitionConfi
   const supportedReasoningEfforts = normalizeReasoningOptions(record.supportedReasoningEfforts);
   const reasoningEffortMap = normalizeConfiguredReasoningEffortMap(record.reasoningEffortMap);
   const compat: NonNullable<ModelDefinitionConfig["compat"]> = {};
-  if (typeof record.supportsUsageInStreaming === "boolean") {
-    compat.supportsUsageInStreaming = record.supportsUsageInStreaming;
+  for (const key of LMSTUDIO_CONFIGURED_BOOLEAN_COMPAT_FIELDS) {
+    const configuredValue = record[key];
+    if (typeof configuredValue === "boolean") {
+      compat[key] = configuredValue;
+    }
   }
-  if (typeof record.supportsReasoningEffort === "boolean") {
-    compat.supportsReasoningEffort = record.supportsReasoningEffort;
+  if (record.codeMode === "preferred" || record.codeMode === "capable") {
+    compat.codeMode = record.codeMode;
+  }
+  for (const key of ["visibleReasoningDetailTypes", "unsupportedToolSchemaKeywords"] as const) {
+    const configuredValue = normalizeConfiguredCompatStringList(record[key]);
+    if (configuredValue) {
+      compat[key] = configuredValue;
+    }
+  }
+  if (record.maxTokensField === "max_completion_tokens" || record.maxTokensField === "max_tokens") {
+    compat.maxTokensField = record.maxTokensField;
+  }
+  const thinkingFormat = LMSTUDIO_CONFIGURED_THINKING_FORMATS.find(
+    (format) => format === record.thinkingFormat,
+  );
+  if (thinkingFormat) {
+    compat.thinkingFormat = thinkingFormat;
+  }
+  for (const key of ["toolSchemaProfile", "toolCallArgumentsEncoding"] as const) {
+    if (typeof record[key] === "string") {
+      compat[key] = record[key];
+    }
   }
   if (supportedReasoningEfforts.length > 0) {
     compat.supportedReasoningEfforts = supportedReasoningEfforts;
@@ -235,11 +285,13 @@ function normalizeLmstudioConfiguredCompat(value: unknown): ModelDefinitionConfi
   if (reasoningEffortMap) {
     compat.reasoningEffortMap = reasoningEffortMap;
   }
-  return Object.keys(compat).length > 0 ? compat : undefined;
+  return Object.keys(compat).length > 0
+    ? normalizeLmstudioTransportReasoningCompat(compat)
+    : undefined;
 }
 
-function toFetchableLmstudioBaseUrl(value: string): string {
-  if (hasExplicitHttpScheme(value) || !isLikelyHostBaseUrl(value)) {
+export function toFetchableLmstudioBaseUrl(value: string): string {
+  if (/^https?:\/\//i.test(value) || !isLikelyHostBaseUrl(value)) {
     return value;
   }
   return `http://${value}`;
@@ -247,9 +299,8 @@ function toFetchableLmstudioBaseUrl(value: string): string {
 
 /** Resolves LM Studio server base URL (without /v1 or /api/v1). */
 export function resolveLmstudioServerBase(configuredBaseUrl?: string): string {
-  // Use configured value when present; otherwise target local LM Studio default.
   const configured = configuredBaseUrl?.trim();
-  const resolved = configured && configured.length > 0 ? configured : LMSTUDIO_DEFAULT_BASE_URL;
+  const resolved = configured || LMSTUDIO_DEFAULT_BASE_URL;
   const fetchableBaseUrl = toFetchableLmstudioBaseUrl(resolved);
   try {
     const parsed = new URL(fetchableBaseUrl);
@@ -319,14 +370,8 @@ export function normalizeLmstudioConfiguredCatalogEntry(
   }
   const id = record.id.trim();
   const name = typeof record.name === "string" && record.name.trim().length > 0 ? record.name : id;
-  const contextWindow =
-    typeof record.contextWindow === "number" && record.contextWindow > 0
-      ? record.contextWindow
-      : undefined;
-  const contextTokens =
-    typeof record.contextTokens === "number" && record.contextTokens > 0
-      ? record.contextTokens
-      : undefined;
+  const contextWindow = asPositiveSafeInteger(record.contextWindow);
+  const contextTokens = asPositiveSafeInteger(record.contextTokens);
   const reasoning = typeof record.reasoning === "boolean" ? record.reasoning : undefined;
   const input = Array.isArray(record.input)
     ? record.input.filter(
@@ -423,20 +468,28 @@ export function mapLmstudioWireEntry(entry: LmstudioModelWire): LmstudioModelBas
     return null;
   }
   const loadedContextWindow = resolveLoadedContextWindow(entry);
-  const advertisedContextWindow =
-    entry.max_context_length !== undefined &&
-    Number.isFinite(entry.max_context_length) &&
-    entry.max_context_length > 0
-      ? Math.floor(entry.max_context_length)
-      : null;
+  const advertisedContextWindow = asPositiveSafeInteger(entry.max_context_length) ?? null;
   const contextWindow = advertisedContextWindow ?? SELF_HOSTED_DEFAULT_CONTEXT_WINDOW;
-  // Keep native/advertised context window metadata in catalog, but use a practical
-  // default target for model loading unless callers explicitly override it.
-  const contextTokens = Math.min(contextWindow, LMSTUDIO_DEFAULT_LOAD_CONTEXT_LENGTH);
+  // ModelDefinitionConfig keeps the native maximum in contextWindow. Runtime
+  // budgeting reads contextTokens, so it must reflect what the server actually
+  // serves: a loaded instance is authoritative for its own context, while an
+  // unloaded model is budgeted at the length JIT loading will request — the
+  // same clamp ensureLmstudioModelLoaded applies when it triggers the load.
+  const effectiveContextWindow = loadedContextWindow ?? contextWindow;
+  const contextTokens =
+    loadedContextWindow ?? Math.min(contextWindow, LMSTUDIO_DEFAULT_LOAD_CONTEXT_LENGTH);
   const rawDisplayName = entry.display_name?.trim();
+  const reasoningCompat = resolveLmstudioReasoningCompat(entry);
+  const trainedForToolUse = entry.capabilities?.trained_for_tool_use;
+  // Native tool training is a positive capability, not proof that LM Studio's
+  // OpenAI-compatible fallback cannot call tools.
+  const compat =
+    trainedForToolUse === true
+      ? { ...reasoningCompat, supportsTools: trainedForToolUse }
+      : reasoningCompat;
   return {
     id,
-    displayName: rawDisplayName && rawDisplayName.length > 0 ? rawDisplayName : id,
+    displayName: rawDisplayName || id,
     format: entry.format ?? null,
     vision: entry.capabilities?.vision === true,
     trainedForToolUse: entry.capabilities?.trained_for_tool_use === true,
@@ -446,20 +499,23 @@ export function mapLmstudioWireEntry(entry: LmstudioModelWire): LmstudioModelBas
     reasoning: resolveLmstudioReasoningCapability(entry),
     input: entry.capabilities?.vision ? ["text", "image"] : ["text"],
     cost: SELF_HOSTED_DEFAULT_COST,
-    compat: resolveLmstudioReasoningCompat(entry),
+    compat,
     contextWindow,
     contextTokens,
-    maxTokens: Math.max(1, Math.min(contextWindow, SELF_HOSTED_DEFAULT_MAX_TOKENS)),
+    maxTokens: Math.max(1, Math.min(effectiveContextWindow, SELF_HOSTED_DEFAULT_MAX_TOKENS)),
   };
 }
 
-/**
- * Maps LM Studio wire models to config entries using plain display names.
- * Use this for config persistence where runtime format/state tags are not needed.
- * For runtime discovery with enriched names, use discoverLmstudioModels from models.fetch.ts.
- */
 export function mapLmstudioWireModelsToConfig(
   models: LmstudioModelWire[],
+): ModelDefinitionConfig[] {
+  return mapLmstudioWireModels(models, "config");
+}
+
+/** Config persistence keeps plain names; runtime discovery adds state tags and usage compat. */
+export function mapLmstudioWireModels(
+  models: LmstudioModelWire[],
+  mode: "config" | "runtime",
 ): ModelDefinitionConfig[] {
   return models
     .map((entry): ModelDefinitionConfig | null => {
@@ -469,11 +525,15 @@ export function mapLmstudioWireModelsToConfig(
       }
       return {
         id: base.id,
-        name: base.displayName,
+        name: mode === "runtime" ? buildLmstudioModelName(base) : base.displayName,
         reasoning: base.reasoning,
         input: base.input,
         cost: base.cost,
-        ...(base.compat ? { compat: base.compat } : {}),
+        ...(mode === "runtime"
+          ? { compat: { ...base.compat, supportsUsageInStreaming: true } }
+          : base.compat
+            ? { compat: base.compat }
+            : {}),
         contextWindow: base.contextWindow,
         contextTokens: base.contextTokens,
         maxTokens: base.maxTokens,

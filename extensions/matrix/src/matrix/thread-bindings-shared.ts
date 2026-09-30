@@ -4,7 +4,7 @@ import type {
 } from "openclaw/plugin-sdk/thread-bindings-session-runtime";
 import { resolveThreadBindingLifecycle } from "openclaw/plugin-sdk/thread-bindings-session-runtime";
 
-export type MatrixThreadBindingTargetKind = "subagent" | "acp";
+type MatrixThreadBindingTargetKind = "subagent" | "acp";
 
 export type MatrixThreadBindingRecord = {
   accountId: string;
@@ -41,11 +41,11 @@ export type MatrixThreadBindingManager = {
     maxAgeMs: number;
   }) => MatrixThreadBindingRecord[];
   persist: () => Promise<void>;
-  stop: () => void;
+  stop: () => Promise<void>;
 };
 
-export type MatrixThreadBindingManagerCacheEntry = {
-  filePath: string;
+type MatrixThreadBindingManagerCacheEntry = {
+  storageKey: string;
   manager: MatrixThreadBindingManager;
 };
 
@@ -68,22 +68,11 @@ export function toMatrixBindingTargetKind(raw: BindingTargetKind): MatrixThreadB
   return raw === "subagent" ? "subagent" : "acp";
 }
 
-export function resolveEffectiveBindingExpiry(params: {
-  record: MatrixThreadBindingRecord;
-  defaultIdleTimeoutMs: number;
-  defaultMaxAgeMs: number;
-}): {
-  expiresAt?: number;
-  reason?: "idle-expired" | "max-age-expired";
-} {
-  return resolveThreadBindingLifecycle(params);
-}
-
 export function toSessionBindingRecord(
   record: MatrixThreadBindingRecord,
   defaults: { idleTimeoutMs: number; maxAgeMs: number },
 ): SessionBindingRecord {
-  const lifecycle = resolveEffectiveBindingExpiry({
+  const lifecycle = resolveThreadBindingLifecycle({
     record,
     defaultIdleTimeoutMs: defaults.idleTimeoutMs,
     defaultMaxAgeMs: defaults.maxAgeMs,
@@ -195,12 +184,4 @@ export function setMatrixThreadBindingMaxAgeBySessionKey(params: {
       maxAgeMs: manager.getMaxAgeMs(),
     }),
   );
-}
-
-export function resetMatrixThreadBindingsForTests(): void {
-  for (const { manager } of MANAGERS_BY_ACCOUNT_ID.values()) {
-    manager.stop();
-  }
-  MANAGERS_BY_ACCOUNT_ID.clear();
-  BINDINGS_BY_ACCOUNT_CONVERSATION.clear();
 }

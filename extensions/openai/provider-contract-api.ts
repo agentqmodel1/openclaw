@@ -1,59 +1,85 @@
 import type { ProviderPlugin } from "openclaw/plugin-sdk/provider-model-shared";
+import { decodeOpenAICodexJwtPayload } from "openclaw/plugin-sdk/provider-oauth-runtime";
 import {
-  OPENAI_API_KEY_LABEL,
-  OPENAI_CODEX_DEVICE_PAIRING_HINT,
-  OPENAI_CODEX_DEVICE_PAIRING_LABEL,
-  OPENAI_CODEX_LOGIN_HINT,
-  OPENAI_CODEX_LOGIN_LABEL,
-  OPENAI_API_KEY_WIZARD_GROUP,
-  OPENAI_CODEX_WIZARD_GROUP,
-} from "./auth-choice-copy.js";
+  asNonArrayRecord,
+  normalizeOptionalString,
+} from "openclaw/plugin-sdk/string-coerce-runtime";
+import { isSIWCAuthFlow } from "./token-sharing.js";
 
 const noopAuth = async () => ({ profiles: [] });
+const OPENAI_API_KEY_LABEL = "OpenAI API Key";
+const OPENAI_CHATGPT_LOGIN_LABEL = "Codex login (browser)";
+const OPENAI_CHATGPT_LOGIN_HINT = "Sign in to Codex locally with your ChatGPT account";
+const OPENAI_CHATGPT_DEVICE_PAIRING_LABEL = "Codex login (device code)";
+const OPENAI_CHATGPT_DEVICE_PAIRING_HINT = "Use a browser code when OpenClaw runs on a remote VM";
+const OPENAI_ACCOUNT_WIZARD_GROUP = {
+  groupId: "openai",
+  groupLabel: "OpenAI",
+  groupHint: "Codex login, Sign in with ChatGPT (Beta), or API key",
+} as const;
+const CODEX_CHATGPT_IMPORT = {
+  migrationProviderId: "codex",
+  itemId: "auth:openai",
+  credentialKind: "oauth",
+} as const;
+const CODEX_API_KEY_IMPORT = {
+  migrationProviderId: "codex",
+  itemId: "auth:openai:api-key",
+  credentialKind: "api_key",
+} as const;
 
-export function createOpenAICodexProvider(): ProviderPlugin {
-  return {
-    id: "openai-codex",
-    label: "OpenAI Codex",
-    docsPath: "/providers/models",
-    oauthProfileIdRepairs: [
-      {
-        legacyProfileId: "openai-codex:default",
-        promptLabel: "OpenAI Codex",
-      },
-    ],
-    auth: [
-      {
-        id: "oauth",
-        kind: "oauth",
-        label: OPENAI_CODEX_LOGIN_LABEL,
-        hint: OPENAI_CODEX_LOGIN_HINT,
-        run: noopAuth,
-        wizard: {
-          choiceId: "openai-codex",
-          choiceLabel: OPENAI_CODEX_LOGIN_LABEL,
-          choiceHint: OPENAI_CODEX_LOGIN_HINT,
-          assistantPriority: -30,
-          ...OPENAI_CODEX_WIZARD_GROUP,
-        },
-      },
-      {
-        id: "device-code",
-        kind: "device_code",
-        label: OPENAI_CODEX_DEVICE_PAIRING_LABEL,
-        hint: OPENAI_CODEX_DEVICE_PAIRING_HINT,
-        run: noopAuth,
-        wizard: {
-          choiceId: "openai-codex-device-code",
-          choiceLabel: OPENAI_CODEX_DEVICE_PAIRING_LABEL,
-          choiceHint: OPENAI_CODEX_DEVICE_PAIRING_HINT,
-          assistantPriority: -10,
-          ...OPENAI_CODEX_WIZARD_GROUP,
-        },
-      },
-    ],
-  };
+const matchesTokenSharingAccount: NonNullable<
+  ProviderPlugin["auth"][number]["matchesPersonalAccount"]
+> = (credential, existing) => {
+  if (
+    credential.type !== "oauth" ||
+    existing.type !== "oauth" ||
+    credential.provider !== "openai" ||
+    existing.provider !== "openai" ||
+    !isSIWCAuthFlow(credential.authFlow) ||
+    !isSIWCAuthFlow(existing.authFlow) ||
+    !credential.idToken ||
+    !existing.idToken ||
+    !credential.clientId ||
+    credential.clientId !== existing.clientId
+  ) {
+    return false;
+  }
+  // Issuance verified these ID tokens; decoding here only compares persisted subjects.
+  const current = decodeOpenAICodexJwtPayload(credential.idToken);
+  const previous = decodeOpenAICodexJwtPayload(existing.idToken);
+  return Boolean(current?.sub && current.sub === previous?.sub && current.iss === previous?.iss);
+};
+
+function accountSubject(access: string): { accountId: string; userId: string } | undefined {
+  const claims = asNonArrayRecord(
+    decodeOpenAICodexJwtPayload(access)?.["https://api.openai.com/auth"],
+  );
+  const accountId = normalizeOptionalString(claims.chatgpt_account_id);
+  const userId =
+    normalizeOptionalString(claims.chatgpt_user_id) ?? normalizeOptionalString(claims.user_id);
+  return accountId && userId ? { accountId, userId } : undefined;
 }
+
+const matchesPersonalAccount: NonNullable<
+  ProviderPlugin["auth"][number]["matchesPersonalAccount"]
+> = (credential, existing) => {
+  if (
+    credential.type !== "oauth" ||
+    existing.type !== "oauth" ||
+    credential.provider !== "openai" ||
+    existing.provider !== credential.provider
+  ) {
+    return false;
+  }
+  // A ChatGPT account is a workspace, not a person. Reconnect also requires
+  // the exact user; missing claims must not replace any owned credential.
+  const subject = accountSubject(credential.access);
+  const previous = accountSubject(existing.access);
+  return Boolean(
+    subject && previous?.accountId === subject.accountId && previous.userId === subject.userId,
+  );
+};
 
 export function createOpenAIProvider(): ProviderPlugin {
   return {
@@ -64,16 +90,67 @@ export function createOpenAIProvider(): ProviderPlugin {
     envVars: ["OPENAI_API_KEY"],
     auth: [
       {
+        id: "oauth",
+        kind: "oauth",
+        label: OPENAI_CHATGPT_LOGIN_LABEL,
+        hint: OPENAI_CHATGPT_LOGIN_HINT,
+        run: noopAuth,
+        matchesPersonalAccount,
+        credentialImport: CODEX_CHATGPT_IMPORT,
+        wizard: {
+          choiceId: "openai",
+          choiceLabel: OPENAI_CHATGPT_LOGIN_LABEL,
+          choiceHint: OPENAI_CHATGPT_LOGIN_HINT,
+          assistantPriority: -10,
+          ...OPENAI_ACCOUNT_WIZARD_GROUP,
+        },
+      },
+      {
+        id: "device-code",
+        kind: "device_code",
+        label: OPENAI_CHATGPT_DEVICE_PAIRING_LABEL,
+        hint: OPENAI_CHATGPT_DEVICE_PAIRING_HINT,
+        run: noopAuth,
+        matchesPersonalAccount,
+        credentialImport: CODEX_CHATGPT_IMPORT,
+        wizard: {
+          choiceId: "openai-device-code",
+          choiceLabel: OPENAI_CHATGPT_DEVICE_PAIRING_LABEL,
+          choiceHint: OPENAI_CHATGPT_DEVICE_PAIRING_HINT,
+          assistantPriority: -40,
+          onboardingFeatured: true,
+          ...OPENAI_ACCOUNT_WIZARD_GROUP,
+        },
+      },
+      {
+        id: "siwc",
+        kind: "oauth",
+        label: "Sign in with ChatGPT (Beta)",
+        hint: "Authorize OpenClaw for eligible Responses models using your Codex allowance",
+        run: noopAuth,
+        matchesPersonalAccount: matchesTokenSharingAccount,
+        wizard: {
+          choiceId: "openai-token-sharing",
+          choiceLabel: "Sign in with ChatGPT (Beta)",
+          choiceHint: "Authorize OpenClaw for eligible Responses models using your Codex allowance",
+          assistantPriority: 0,
+          ...OPENAI_ACCOUNT_WIZARD_GROUP,
+        },
+      },
+      {
         id: "api-key",
         kind: "api_key",
         label: OPENAI_API_KEY_LABEL,
         hint: "Use your OpenAI API key directly",
         run: noopAuth,
+        credentialImport: CODEX_API_KEY_IMPORT,
         wizard: {
           choiceId: "openai-api-key",
           choiceLabel: OPENAI_API_KEY_LABEL,
-          assistantPriority: -40,
-          ...OPENAI_API_KEY_WIZARD_GROUP,
+          choiceHint: "Use your OpenAI API key directly",
+          assistantPriority: 5,
+          onboardingFeatured: true,
+          ...OPENAI_ACCOUNT_WIZARD_GROUP,
         },
       },
     ],

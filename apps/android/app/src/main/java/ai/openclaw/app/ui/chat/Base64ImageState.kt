@@ -11,22 +11,27 @@ import androidx.compose.ui.graphics.asImageBitmap
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
+/** Compose state for async base64 image decoding. */
 internal data class Base64ImageState(
   val image: ImageBitmap?,
   val failed: Boolean,
 )
 
+/** Decodes a base64 image off the UI thread and reports failure state. */
 @Composable
-internal fun rememberBase64ImageState(base64: String): Base64ImageState {
-  var image by remember(base64) { mutableStateOf<ImageBitmap?>(null) }
-  var failed by remember(base64) { mutableStateOf(false) }
+internal fun rememberBase64ImageState(
+  base64: String,
+  source: Base64ImageSource = Base64ImageSource.Inline,
+): Base64ImageState {
+  var image by remember(base64, source) { mutableStateOf<ImageBitmap?>(null) }
+  var failed by remember(base64, source) { mutableStateOf(false) }
 
-  LaunchedEffect(base64) {
+  LaunchedEffect(base64, source) {
     failed = false
     image =
       withContext(Dispatchers.Default) {
         try {
-          val bitmap = decodeBase64Bitmap(base64) ?: return@withContext null
+          val bitmap = decodeBase64Bitmap(base64, source = source) ?: return@withContext null
           bitmap.asImageBitmap()
         } catch (_: Throwable) {
           null

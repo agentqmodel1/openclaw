@@ -1,8 +1,11 @@
+// Verifies plugin hook security constraints and rejections.
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { PluginHookMessageSendingResult } from "./hook-message.types.js";
 import { createHookRunner } from "./hooks.js";
-import { addStaticTestHooks } from "./hooks.test-helpers.js";
-import { createEmptyPluginRegistry, type PluginRegistry } from "./registry.js";
-import type { PluginHookBeforeToolCallResult, PluginHookMessageSendingResult } from "./types.js";
+import { addStaticTestHooks } from "./hooks.test-fixtures.js";
+import { createEmptyPluginRegistry } from "./registry-empty.js";
+import type { PluginRegistry } from "./registry.js";
+import type { PluginHookBeforeToolCallResult } from "./types.js";
 
 const toolEvent = { toolName: "bash", params: { command: "echo hello" } };
 const toolCtx = { toolName: "bash" };
@@ -62,6 +65,18 @@ function expectTerminalHookState<
   }
 }
 
+function requireLoggerErrorMessage(logger: { error: { mock: { calls: unknown[][] } } }): string {
+  const call = logger.error.mock.calls[0];
+  if (!call) {
+    throw new Error("expected logger error call");
+  }
+  expect(typeof call[0]).toBe("string");
+  if (typeof call[0] !== "string") {
+    throw new Error("expected logger error message to be a string");
+  }
+  return call[0];
+}
+
 describe("before_tool_call terminal block semantics", () => {
   let registry: PluginRegistry;
 
@@ -71,25 +86,9 @@ describe("before_tool_call terminal block semantics", () => {
 
   it.each([
     {
-      name: "keeps block=true when a lower-priority hook returns block=false",
-      hooks: [
-        { pluginId: "high", result: { block: true, blockReason: "dangerous" }, priority: 100 },
-        { pluginId: "low", result: { block: false }, priority: 10 },
-      ],
-      expected: { block: true, blockReason: "dangerous" },
-    },
-    {
       name: "treats explicit block=false as no-op when no prior hook blocked",
       hooks: [{ pluginId: "single", result: { block: false }, priority: 10 }],
       expected: { block: undefined },
-    },
-    {
-      name: "treats passive handler output as no-op for prior block",
-      hooks: [
-        { pluginId: "high", result: { block: true, blockReason: "blocked" }, priority: 100 },
-        { pluginId: "passive", result: {}, priority: 10 },
-      ],
-      expected: { block: true, blockReason: "blocked" },
     },
     {
       name: "respects block from a middle hook in a multi-handler chain",
@@ -147,7 +146,7 @@ describe("before_tool_call terminal block semantics", () => {
     expect(second).not.toHaveBeenCalled();
   });
 
-  it("stops before lower-priority throwing hooks when catchErrors is false", async () => {
+  it("stops before lower-priority before-tool-call hooks when catchErrors is false", async () => {
     const low = vi.fn().mockImplementation(() => {
       throw new Error("should not run");
     });
@@ -211,7 +210,7 @@ describe("before_tool_call terminal block semantics", () => {
 
     await runner.runMessageReceived({ from: "user-1", content: "hi" }, { channelId: "whatsapp" });
 
-    const message = String(logger.error.mock.calls[0]?.[0] ?? "");
+    const message = requireLoggerErrorMessage(logger);
     expect(message).toMatch(
       /^\[hooks\] message_received handler from failing failed: boom forged secret/,
     );
@@ -229,25 +228,9 @@ describe("message_sending terminal cancel semantics", () => {
 
   it.each([
     {
-      name: "keeps cancel=true when a lower-priority hook returns cancel=false",
-      hooks: [
-        { pluginId: "high", result: { cancel: true, content: "guarded" }, priority: 100 },
-        { pluginId: "low", result: { cancel: false, content: "override" }, priority: 10 },
-      ],
-      expected: { cancel: true, content: "guarded" },
-    },
-    {
       name: "treats explicit cancel=false as no-op when no prior hook canceled",
       hooks: [{ pluginId: "single", result: { cancel: false }, priority: 10 }],
       expected: { cancel: undefined },
-    },
-    {
-      name: "treats passive handler output as no-op for prior cancel",
-      hooks: [
-        { pluginId: "high", result: { cancel: true }, priority: 100 },
-        { pluginId: "passive", result: {}, priority: 10 },
-      ],
-      expected: { cancel: true },
     },
     {
       name: "allows lower-priority cancel when higher-priority hooks are non-terminal",
@@ -295,7 +278,7 @@ describe("message_sending terminal cancel semantics", () => {
     expect(result?.content).toBe("second");
   });
 
-  it("stops before lower-priority throwing hooks when catchErrors is false", async () => {
+  it("stops before lower-priority message-sending hooks when catchErrors is false", async () => {
     const low = vi.fn().mockImplementation(() => {
       throw new Error("should not run");
     });

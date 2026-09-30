@@ -6,12 +6,11 @@ import {
   type ButtonInteraction,
   type ComponentData,
 } from "../internal/discord.js";
-import {
-  parseDiscordComponentData,
-  resolveInteractionCustomId,
-  type AgentComponentContext,
-  type AgentComponentMessageInteraction,
-} from "./agent-components-helpers.js";
+import { parseDiscordComponentData, resolveInteractionCustomId } from "./agent-components-data.js";
+import type {
+  AgentComponentContext,
+  AgentComponentMessageInteraction,
+} from "./agent-components.types.js";
 
 export type DiscordComponentControlHandlers = {
   handleComponentEvent: (params: {
@@ -71,7 +70,7 @@ const SELECT_CONTROLS = {
 } satisfies Record<string, SelectControlSpec>;
 
 class DiscordComponentSelectControl extends BaseMessageInteractiveComponent {
-  customIdParser = parseDiscordComponentCustomIdForInteraction;
+  override customIdParser = parseDiscordComponentCustomIdForInteraction;
   readonly type: ComponentType;
   readonly customId: string;
 
@@ -91,7 +90,10 @@ class DiscordComponentSelectControl extends BaseMessageInteractiveComponent {
       : { type: this.type, custom_id: this.customId };
   }
 
-  async run(interaction: AgentComponentMessageInteraction, data: ComponentData): Promise<void> {
+  override async run(
+    interaction: AgentComponentMessageInteraction,
+    data: ComponentData,
+  ): Promise<void> {
     await this.handlers.handleComponentEvent({
       ctx: this.ctx,
       interaction,
@@ -104,10 +106,10 @@ class DiscordComponentSelectControl extends BaseMessageInteractiveComponent {
 }
 
 class DiscordComponentButton extends Button {
-  label = "component";
-  customId = "__openclaw_discord_component_button_wildcard__";
-  style = ButtonStyle.Primary;
-  customIdParser = parseDiscordComponentCustomIdForInteraction;
+  override label = "component";
+  override customId = "__openclaw_discord_component_button_wildcard__";
+  override style = ButtonStyle.Primary;
+  override customIdParser = parseDiscordComponentCustomIdForInteraction;
 
   constructor(
     private ctx: AgentComponentContext,
@@ -116,7 +118,7 @@ class DiscordComponentButton extends Button {
     super();
   }
 
-  async run(interaction: ButtonInteraction, data: ComponentData): Promise<void> {
+  override async run(interaction: ButtonInteraction, data: ComponentData): Promise<void> {
     const parsed = parseDiscordComponentData(data, resolveInteractionCustomId(interaction));
     if (parsed?.modalId) {
       await this.handlers.handleModalTrigger({
@@ -137,17 +139,9 @@ class DiscordComponentButton extends Button {
   }
 }
 
-function createSelectControl(
-  spec: SelectControlSpec,
-  ctx: AgentComponentContext,
-  handlers: DiscordComponentControlHandlers,
-): BaseMessageInteractiveComponent {
-  return new DiscordComponentSelectControl(spec, ctx, handlers);
-}
-
 function bindSelectControl(spec: SelectControlSpec) {
   return (ctx: AgentComponentContext, handlers: DiscordComponentControlHandlers) =>
-    createSelectControl(spec, ctx, handlers);
+    new DiscordComponentSelectControl(spec, ctx, handlers);
 }
 
 export function createDiscordComponentButtonControl(

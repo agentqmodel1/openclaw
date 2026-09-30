@@ -1,6 +1,7 @@
 import { Buffer } from "node:buffer";
 import { once } from "node:events";
 import http, { type IncomingMessage, type ServerResponse } from "node:http";
+import { MAX_TIMER_TIMEOUT_MS } from "openclaw/plugin-sdk/number-runtime";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 vi.mock("openclaw/plugin-sdk/core", async () => {
@@ -51,6 +52,7 @@ beforeAll(async () => {
 });
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   await Promise.all(
     servers.splice(0).map(
       (server) =>
@@ -68,10 +70,30 @@ afterEach(async () => {
 });
 
 describe("signalRpcRequest", () => {
-  it("returns parsed RPC result", async () => {
-    const baseUrl = await withSignalServer(async (req, res) => {
+  it.each([{ bytes: [0xff] }, { bytes: [0xc3] }])(
+    "rejects malformed UTF-8 bytes $bytes before JSON parsing",
+    async ({ bytes }) => {
+      const baseUrl = await withSignalServer((_req, res) => {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(
+          Buffer.concat([
+            Buffer.from('{"jsonrpc":"2.0","result":{"version":"'),
+            Buffer.from(bytes),
+            Buffer.from('"},"id":"test-id"}'),
+          ]),
+        );
+      });
+
+      await expect(signalRpcRequest("version", undefined, { baseUrl })).rejects.toBeInstanceOf(
+        TypeError,
+      );
+    },
+  );
+
+  it("preserves path-prefixed base URLs for RPC requests", async () => {
+    const serverUrl = await withSignalServer(async (req, res) => {
       expect(req.method).toBe("POST");
-      expect(req.url).toBe("/api/v1/rpc");
+      expect(req.url).toBe("/signal/api/v1/rpc");
       expect(req.headers["content-type"]).toBe("application/json");
       expect(JSON.parse(await readRequestBody(req))).toEqual({
         jsonrpc: "2.0",
@@ -82,11 +104,11 @@ describe("signalRpcRequest", () => {
       res.end(JSON.stringify({ jsonrpc: "2.0", result: { version: "0.13.22" }, id: "test-id" }));
     });
 
-    const result = await signalRpcRequest<{ version: string }>("version", undefined, {
-      baseUrl,
-    });
-
-    expect(result).toEqual({ version: "0.13.22" });
+    await expect(
+      signalRpcRequest<{ version: string }>("version", undefined, {
+        baseUrl: `${serverUrl}/signal/`,
+      }),
+    ).resolves.toEqual({ version: "0.13.22" });
   });
 
   it("throws a wrapped error when RPC response JSON is malformed", async () => {
@@ -95,14 +117,21 @@ describe("signalRpcRequest", () => {
       res.end("not-json");
     });
 
-    await expect(
-      signalRpcRequest("version", undefined, {
+    let thrown: unknown;
+    try {
+      await signalRpcRequest("version", undefined, {
         baseUrl,
-      }),
-    ).rejects.toMatchObject({
-      message: "Signal RPC returned malformed JSON (status 502)",
-      cause: expect.any(SyntaxError),
-    });
+      });
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(Error);
+    if (!(thrown instanceof Error)) {
+      throw new Error("expected malformed JSON request to throw an Error");
+    }
+    expect(thrown.message).toBe("Signal RPC returned malformed JSON (status 502)");
+    expect(thrown.cause).toBeInstanceOf(SyntaxError);
   });
 
   it("throws when RPC response envelope has neither result nor error", async () => {
@@ -214,18 +243,46 @@ describe("signalRpcRequest", () => {
       }),
     ).rejects.toThrow("Signal HTTP exceeded deadline after 25ms");
   });
+
+  it("caps oversized RPC request timeouts before scheduling", async () => {
+    const timeoutSpy = vi.spyOn(globalThis, "setTimeout");
+    const baseUrl = await withSignalServer((_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ jsonrpc: "2.0", result: { version: "0.13.22" }, id: "test-id" }));
+    });
+
+    await signalRpcRequest("version", undefined, {
+      baseUrl,
+      timeoutMs: MAX_TIMER_TIMEOUT_MS + 1_000_000,
+    });
+
+    expect(timeoutSpy).toHaveBeenCalledWith(expect.any(Function), MAX_TIMER_TIMEOUT_MS);
+  });
 });
 
 describe("signalCheck", () => {
-  it("returns ok for a healthy signal-cli check", async () => {
-    const baseUrl = await withSignalServer((req, res) => {
+  it("uses only the status when the unused response body is malformed UTF-8", async () => {
+    const baseUrl = await withSignalServer((_req, res) => {
+      res.writeHead(200);
+      res.end(Buffer.from([0xff]));
+    });
+
+    await expect(signalCheck(baseUrl)).resolves.toEqual({ ok: true, status: 200, error: null });
+  });
+
+  it("preserves path-prefixed base URLs for health checks", async () => {
+    const serverUrl = await withSignalServer((req, res) => {
       expect(req.method).toBe("GET");
-      expect(req.url).toBe("/api/v1/check");
+      expect(req.url).toBe("/signal/api/v1/check");
       res.writeHead(204);
       res.end();
     });
 
-    await expect(signalCheck(baseUrl)).resolves.toEqual({ ok: true, status: 204, error: null });
+    await expect(signalCheck(`${serverUrl}/signal`)).resolves.toEqual({
+      ok: true,
+      status: 204,
+      error: null,
+    });
   });
 
   it("returns an HTTP status failure for unhealthy checks", async () => {
@@ -243,22 +300,43 @@ describe("signalCheck", () => {
 });
 
 describe("streamSignalEvents", () => {
-  it("streams events through node http instead of fetch", async () => {
-    const events: Array<import("./client.js").SignalSseEvent> = [];
-    const baseUrl = await withSignalServer((req, res) => {
-      expect(req.url).toBe("/api/v1/events?account=%2B15555550123");
+  it("preserves path-prefixed base URLs for event streams", async () => {
+    type StreamEvent = Parameters<Parameters<typeof streamSignalEvents>[0]["onEvent"]>[0];
+    const events: StreamEvent[] = [];
+    const onStreamOpen = vi.fn();
+    const serverUrl = await withSignalServer((req, res) => {
+      expect(req.url).toBe("/signal/api/v1/events?account=%2B15555550123");
       expect(req.headers.accept).toBe("text/event-stream");
       res.writeHead(200, { "Content-Type": "text/event-stream" });
       res.end('id: 42\nevent: message\ndata: {"group":true}\n\n');
     });
 
     await streamSignalEvents({
-      baseUrl,
+      baseUrl: `${serverUrl}/signal`,
       account: "+15555550123",
       onEvent: (event) => events.push(event),
+      onStreamOpen,
     });
 
+    expect(onStreamOpen).toHaveBeenCalledOnce();
     expect(events).toEqual([{ id: "42", event: "message", data: '{"group":true}' }]);
+  });
+
+  it("propagates receive-handler failures to the stream", async () => {
+    const appendError = new Error("durable append failed");
+    const baseUrl = await withSignalServer((_req, res) => {
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      res.end('event: receive\ndata: {"envelope":{}}\n\n');
+    });
+
+    await expect(
+      streamSignalEvents({
+        baseUrl,
+        onEvent: async () => {
+          throw appendError;
+        },
+      }),
+    ).rejects.toBe(appendError);
   });
 
   it("reports HTTP status failures from the event stream", async () => {
@@ -272,7 +350,10 @@ describe("streamSignalEvents", () => {
         baseUrl,
         onEvent: () => {},
       }),
-    ).rejects.toThrow("Signal SSE failed (503 Unavailable)");
+    ).rejects.toMatchObject({
+      message: "Signal SSE failed (503 Unavailable)",
+      status: 503,
+    });
   });
 
   it("rejects event streams that do not send headers before the deadline", async () => {

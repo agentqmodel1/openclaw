@@ -1,19 +1,23 @@
-import fs from "node:fs";
+/** Loads bundled channel config schema metadata from source or public surface modules. */
 import path from "node:path";
-import { buildChannelConfigSchema } from "../channels/plugins/config-schema.js";
+import {
+  buildChannelConfigSchema,
+  buildJsonChannelConfigSchema,
+} from "../channels/plugins/config-schema.js";
 import type { ChannelConfigRuntimeSchema } from "../channels/plugins/types.config.js";
 import type { JsonSchemaObject } from "../shared/json-schema.types.js";
 import {
   normalizeBundledPluginStringList,
   trimBundledPluginString,
 } from "./bundled-plugin-scan.js";
-import { getCachedPluginJitiLoader, type PluginJitiLoaderCache } from "./jiti-loader-cache.js";
 import type { PluginConfigUiHint } from "./manifest-types.js";
 import type {
   OpenClawPackageManifest,
   PluginManifest,
   PluginManifestChannelConfig,
 } from "./manifest.js";
+import { pluginCacheExistsSync } from "./plugin-cache-files.js";
+import { getCachedPluginModuleLoader } from "./plugin-module-loader-cache.js";
 import { PUBLIC_SURFACE_SOURCE_EXTENSIONS } from "./public-surface-runtime.js";
 
 const SOURCE_CONFIG_SCHEMA_CANDIDATES = [
@@ -32,14 +36,30 @@ type ChannelConfigSurface = {
   runtime?: ChannelConfigRuntimeSchema;
 };
 
-const jitiLoaders: PluginJitiLoaderCache = new Map();
-
 function isBuiltChannelConfigSchema(value: unknown): value is ChannelConfigSurface {
   if (!value || typeof value !== "object") {
     return false;
   }
   const candidate = value as { schema?: unknown };
   return Boolean(candidate.schema && typeof candidate.schema === "object");
+}
+
+function isJsonSchemaConfigSurface(value: unknown): value is JsonSchemaObject {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  const candidate = value as Record<string, unknown>;
+  if (typeof candidate.safeParse === "function" || typeof candidate.toJSONSchema === "function") {
+    return false;
+  }
+  return (
+    typeof candidate.type === "string" ||
+    Array.isArray(candidate.anyOf) ||
+    Array.isArray(candidate.oneOf) ||
+    Array.isArray(candidate.allOf) ||
+    Array.isArray(candidate.enum) ||
+    Object.hasOwn(candidate, "const")
+  );
 }
 
 function resolveConfigSchemaExport(imported: Record<string, unknown>): ChannelConfigSurface | null {
@@ -56,41 +76,37 @@ function resolveConfigSchemaExport(imported: Record<string, unknown>): ChannelCo
     if (isBuiltChannelConfigSchema(value)) {
       return value;
     }
+    if (isJsonSchemaConfigSurface(value)) {
+      return buildJsonChannelConfigSchema(value);
+    }
     if (value && typeof value === "object") {
       return buildChannelConfigSchema(value as never);
     }
   }
 
-  for (const value of Object.values(imported)) {
-    if (isBuiltChannelConfigSchema(value)) {
-      return value;
-    }
-  }
-
-  return null;
+  return Object.values(imported).find(isBuiltChannelConfigSchema) ?? null;
 }
 
-function getJiti(modulePath: string) {
-  return getCachedPluginJitiLoader({
-    cache: jitiLoaders,
+function getModuleLoader(modulePath: string) {
+  return getCachedPluginModuleLoader({
     modulePath,
     importerUrl: import.meta.url,
     preferBuiltDist: true,
-    jitiFilename: import.meta.url,
+    loaderFilename: import.meta.url,
   });
 }
 
 function resolveChannelConfigSchemaModulePath(pluginDir: string): string | undefined {
   for (const relativePath of SOURCE_CONFIG_SCHEMA_CANDIDATES) {
     const candidate = path.join(pluginDir, relativePath);
-    if (fs.existsSync(candidate)) {
+    if (pluginCacheExistsSync(candidate)) {
       return candidate;
     }
   }
   for (const basename of PUBLIC_CONFIG_SURFACE_BASENAMES) {
     for (const extension of PUBLIC_SURFACE_SOURCE_EXTENSIONS) {
       const candidate = path.join(pluginDir, `${basename}${extension}`);
-      if (fs.existsSync(candidate)) {
+      if (pluginCacheExistsSync(candidate)) {
         return candidate;
       }
     }
@@ -100,7 +116,7 @@ function resolveChannelConfigSchemaModulePath(pluginDir: string): string | undef
 
 function loadChannelConfigSurfaceModuleSync(modulePath: string): ChannelConfigSurface | null {
   try {
-    const imported = getJiti(modulePath)(modulePath) as Record<string, unknown>;
+    const imported = getModuleLoader(modulePath)(modulePath) as Record<string, unknown>;
     return resolveConfigSchemaExport(imported);
   } catch {
     return null;
@@ -115,7 +131,7 @@ function resolvePackageChannelMeta(
   return channelMeta?.id?.trim() === channelId ? channelMeta : undefined;
 }
 
-export function collectBundledChannelConfigs(params: {
+export function collectBundledChannelConfigsCore(params: {
   pluginDir: string;
   manifest: PluginManifest;
   packageManifest?: OpenClawPackageManifest;
@@ -136,49 +152,30 @@ export function collectBundledChannelConfigs(params: {
     const existing = existingChannelConfigs[channelId];
     const channelMeta = resolvePackageChannelMeta(params.packageManifest, channelId);
     const preferOver = normalizeBundledPluginStringList(channelMeta?.preferOver);
-    const uiHints: Record<string, PluginConfigUiHint> | undefined =
-      surface?.uiHints || existing?.uiHints
-        ? {
-            ...(surface?.uiHints && Object.keys(surface.uiHints).length > 0 ? surface.uiHints : {}),
-            ...(existing?.uiHints && Object.keys(existing.uiHints).length > 0
-              ? existing.uiHints
-              : {}),
-          }
-        : undefined;
+    const uiHints = { ...surface?.uiHints, ...existing?.uiHints };
 
     if (!surface?.schema && !existing?.schema) {
       continue;
     }
+    const runtime = surface?.runtime ?? existing?.runtime;
+    const label =
+      trimBundledPluginString(existing?.label) ?? trimBundledPluginString(channelMeta?.label);
+    const description =
+      trimBundledPluginString(existing?.description) ?? trimBundledPluginString(channelMeta?.blurb);
+    const commands = existing?.commands ?? channelMeta?.commands;
 
     existingChannelConfigs[channelId] = {
       schema: surface?.schema ?? existing?.schema ?? {},
-      ...(uiHints && Object.keys(uiHints).length > 0 ? { uiHints } : {}),
-      ...((surface?.runtime ?? existing?.runtime)
-        ? { runtime: surface?.runtime ?? existing?.runtime }
-        : {}),
-      ...((trimBundledPluginString(existing?.label) ?? trimBundledPluginString(channelMeta?.label))
-        ? {
-            label:
-              trimBundledPluginString(existing?.label) ??
-              trimBundledPluginString(channelMeta?.label)!,
-          }
-        : {}),
-      ...((trimBundledPluginString(existing?.description) ??
-      trimBundledPluginString(channelMeta?.blurb))
-        ? {
-            description:
-              trimBundledPluginString(existing?.description) ??
-              trimBundledPluginString(channelMeta?.blurb)!,
-          }
-        : {}),
+      ...(Object.keys(uiHints).length > 0 ? { uiHints } : {}),
+      ...(runtime ? { runtime } : {}),
+      ...(label ? { label } : {}),
+      ...(description ? { description } : {}),
       ...(existing?.preferOver?.length
         ? { preferOver: existing.preferOver }
         : preferOver.length > 0
           ? { preferOver }
           : {}),
-      ...((existing?.commands ?? channelMeta?.commands)
-        ? { commands: existing?.commands ?? channelMeta?.commands }
-        : {}),
+      ...(commands ? { commands } : {}),
     };
   }
 

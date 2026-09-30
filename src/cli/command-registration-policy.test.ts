@@ -1,19 +1,11 @@
+// Command registration policy tests cover CLI registration boundaries and duplicate guards.
 import { describe, expect, it } from "vitest";
 import {
   shouldEagerRegisterSubcommands,
-  shouldRegisterPrimaryCommandOnly,
-  shouldRegisterPrimarySubcommandOnly,
   shouldSkipPluginCommandRegistration,
 } from "./command-registration-policy.js";
 
 describe("command-registration-policy", () => {
-  it("matches primary command registration policy", () => {
-    expect(shouldRegisterPrimaryCommandOnly(["node", "openclaw", "status"])).toBe(true);
-    expect(shouldRegisterPrimaryCommandOnly(["node", "openclaw", "status", "--help"])).toBe(true);
-    expect(shouldRegisterPrimaryCommandOnly(["node", "openclaw", "-V"])).toBe(false);
-    expect(shouldRegisterPrimaryCommandOnly(["node", "openclaw", "acp", "-v"])).toBe(true);
-  });
-
   it("matches plugin registration skip policy", () => {
     expect(
       shouldSkipPluginCommandRegistration({
@@ -52,6 +44,20 @@ describe("command-registration-policy", () => {
     ).toBe(false);
     expect(
       shouldSkipPluginCommandRegistration({
+        argv: ["node", "openclaw", "auth", "login"],
+        primary: "auth",
+        hasBuiltinPrimary: false,
+      }),
+    ).toBe(true);
+    expect(
+      shouldSkipPluginCommandRegistration({
+        argv: ["node", "openclaw", "tool", "image_generate"],
+        primary: "tool",
+        hasBuiltinPrimary: false,
+      }),
+    ).toBe(true);
+    expect(
+      shouldSkipPluginCommandRegistration({
         argv: ["node", "openclaw", "tools", "effective"],
         primary: "tools",
         hasBuiltinPrimary: false,
@@ -69,14 +75,5 @@ describe("command-registration-policy", () => {
   it("matches lazy subcommand registration policy", () => {
     expect(shouldEagerRegisterSubcommands({ OPENCLAW_DISABLE_LAZY_SUBCOMMANDS: "1" })).toBe(true);
     expect(shouldEagerRegisterSubcommands({ OPENCLAW_DISABLE_LAZY_SUBCOMMANDS: "0" })).toBe(false);
-    expect(shouldRegisterPrimarySubcommandOnly(["node", "openclaw", "acp"], {})).toBe(true);
-    expect(shouldRegisterPrimarySubcommandOnly(["node", "openclaw", "acp", "--help"], {})).toBe(
-      true,
-    );
-    expect(
-      shouldRegisterPrimarySubcommandOnly(["node", "openclaw", "acp"], {
-        OPENCLAW_DISABLE_LAZY_SUBCOMMANDS: "1",
-      }),
-    ).toBe(false);
   });
 });

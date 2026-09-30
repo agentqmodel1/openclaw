@@ -1,11 +1,16 @@
 import { inspect } from "node:util";
 import { formatDurationSeconds } from "openclaw/plugin-sdk/runtime-env";
 import { formatErrorMessage } from "openclaw/plugin-sdk/ssrf-runtime";
+import {
+  parseFiniteNumber as readFiniteNumber,
+  parseStrictNonNegativeInteger as readNonNegativeInteger,
+} from "openclaw/plugin-sdk/string-coerce-runtime";
+import { truncateUtf16Safe } from "openclaw/plugin-sdk/text-utility-runtime";
 import { RateLimitError } from "../internal/discord.js";
 
 const DISCORD_DEPLOY_REJECTED_ENTRY_LIMIT = 3;
 
-export type DiscordDeployErrorLike = {
+type DiscordDeployErrorLike = {
   status?: unknown;
   statusCode?: unknown;
   discordCode?: unknown;
@@ -13,9 +18,13 @@ export type DiscordDeployErrorLike = {
   scope?: unknown;
   rawBody?: unknown;
   deployRequestBody?: unknown;
+  deployRestMethod?: unknown;
+  deployRestPath?: unknown;
+  deployRequestMs?: unknown;
+  deployTimeoutMs?: unknown;
 };
 
-export type DiscordDeployRateLimitDetails = {
+type DiscordDeployRateLimitDetails = {
   status?: number;
   retryAfterMs?: number;
   scope?: string;
@@ -32,10 +41,28 @@ export function attachDiscordDeployRequestBody(err: unknown, body: unknown) {
   }
 }
 
-function stringifyDiscordDeployField(value: unknown): string {
-  if (typeof value === "string") {
-    return JSON.stringify(value);
+export function attachDiscordDeployRestContext(
+  err: unknown,
+  context: {
+    method: string;
+    path: string;
+    requestMs: number;
+    timeoutMs?: number;
+  },
+) {
+  if (!err || typeof err !== "object") {
+    return;
   }
+  const deployErr = err as DiscordDeployErrorLike;
+  deployErr.deployRestMethod = context.method;
+  deployErr.deployRestPath = context.path;
+  deployErr.deployRequestMs = context.requestMs;
+  if (typeof context.timeoutMs === "number" && Number.isFinite(context.timeoutMs)) {
+    deployErr.deployTimeoutMs = context.timeoutMs;
+  }
+}
+
+function stringifyDiscordDeployField(value: unknown): string {
   try {
     return JSON.stringify(value);
   } catch {
@@ -61,8 +88,7 @@ function resolveDiscordRejectedDeployEntriesSource(
   }
   const payload = rawBody as { errors?: unknown };
   const errors = payload.errors && typeof payload.errors === "object" ? payload.errors : undefined;
-  const source = errors ?? rawBody;
-  return source && typeof source === "object" ? (source as Record<string, unknown>) : null;
+  return (errors ?? rawBody) as Record<string, unknown>;
 }
 
 function readDiscordDeployObjectField(value: unknown, field: string): unknown {
@@ -71,25 +97,81 @@ function readDiscordDeployObjectField(value: unknown, field: string): unknown {
     : undefined;
 }
 
-function readFiniteNumber(value: unknown): number | undefined {
-  if (typeof value === "number" && Number.isFinite(value)) {
-    return value;
+function isAbortLikeError(err: unknown): boolean {
+  if (!err || typeof err !== "object") {
+    return false;
   }
-  if (typeof value === "string" && value.trim().length > 0) {
-    const parsed = Number(value);
-    return Number.isFinite(parsed) ? parsed : undefined;
-  }
-  return undefined;
+  const name = "name" in err && typeof err.name === "string" ? err.name : undefined;
+  const message = formatErrorMessage(err);
+  return (
+    name === "AbortError" ||
+    message === "This operation was aborted" ||
+    message === "The operation was aborted" ||
+    /\boperation was aborted\b/i.test(message)
+  );
 }
 
-export function resolveDiscordDeployRateLimitDetails(
+function formatDiscordDeployRestOperation(err: DiscordDeployErrorLike): string {
+  const method =
+    typeof err.deployRestMethod === "string" && err.deployRestMethod.trim().length > 0
+      ? err.deployRestMethod.toUpperCase()
+      : undefined;
+  const path =
+    typeof err.deployRestPath === "string" && err.deployRestPath.trim().length > 0
+      ? err.deployRestPath
+      : undefined;
+  if (method && path) {
+    return `${method} ${path}`;
+  }
+  return method ?? path ?? "request";
+}
+
+export function formatDiscordDeployErrorMessage(err: unknown): string {
+  if (!isAbortLikeError(err)) {
+    return formatErrorMessage(err);
+  }
+  const deployErr =
+    err && typeof err === "object"
+      ? (err as DiscordDeployErrorLike)
+      : ({} as DiscordDeployErrorLike);
+  const requestMs = readFiniteNumber(deployErr.deployRequestMs);
+  const timeoutMs = readFiniteNumber(deployErr.deployTimeoutMs);
+  const operation = formatDiscordDeployRestOperation(deployErr);
+  const hasRestContext =
+    requestMs !== undefined ||
+    timeoutMs !== undefined ||
+    deployErr.deployRestMethod !== undefined ||
+    deployErr.deployRestPath !== undefined;
+  if (!hasRestContext) {
+    return "Discord REST request was aborted";
+  }
+  const timing: string[] = [];
+  if (timeoutMs !== undefined) {
+    timing.push(
+      `timeout=${formatDurationSeconds(timeoutMs, { decimals: timeoutMs >= 1000 ? 1 : 0 })}`,
+    );
+  }
+  if (requestMs !== undefined) {
+    timing.push(
+      `observed=${formatDurationSeconds(requestMs, { decimals: requestMs >= 1000 ? 1 : 0 })}`,
+    );
+  }
+  const timingText = timing.length > 0 ? ` (${timing.join(", ")})` : "";
+  if (timeoutMs !== undefined && requestMs !== undefined && requestMs >= timeoutMs) {
+    return `Discord REST ${operation} timed out${timingText}`;
+  }
+  return `Discord REST ${operation} was aborted${timingText}`;
+}
+
+function resolveDiscordDeployRateLimitDetails(
   err: unknown,
 ): DiscordDeployRateLimitDetails | undefined {
   if (!err || typeof err !== "object") {
     return undefined;
   }
   const deployErr = err as DiscordDeployErrorLike;
-  const status = readFiniteNumber(deployErr.status) ?? readFiniteNumber(deployErr.statusCode);
+  const status =
+    readNonNegativeInteger(deployErr.status) ?? readNonNegativeInteger(deployErr.statusCode);
   const retryAfterSeconds =
     readFiniteNumber(deployErr.retryAfter) ??
     readFiniteNumber(readDiscordDeployObjectField(deployErr.rawBody, "retry_after"));
@@ -126,10 +208,10 @@ export function formatDiscordDeployRateLimitDetails(err: unknown): string {
     return "";
   }
   const details: string[] = [];
-  if (typeof rateLimit.status === "number") {
+  if (rateLimit.status !== undefined) {
     details.push(`status=${rateLimit.status}`);
   }
-  if (typeof rateLimit.retryAfterMs === "number") {
+  if (rateLimit.retryAfterMs !== undefined) {
     details.push(
       `retryAfter=${formatDurationSeconds(rateLimit.retryAfterMs, {
         decimals: 1,
@@ -139,7 +221,7 @@ export function formatDiscordDeployRateLimitDetails(err: unknown): string {
   if (rateLimit.scope) {
     details.push(`scope=${rateLimit.scope}`);
   }
-  if (typeof rateLimit.discordCode === "number" || typeof rateLimit.discordCode === "string") {
+  if (rateLimit.discordCode !== undefined) {
     details.push(`code=${rateLimit.discordCode}`);
   }
   return details.length > 0 ? ` (${details.join(", ")})` : "";
@@ -153,8 +235,8 @@ export function formatDiscordDeployRateLimitWarning(
   if (!rateLimit) {
     return undefined;
   }
-  const parts = [`discord: native slash command deploy rate limited for ${accountId}`];
-  if (typeof rateLimit.retryAfterMs === "number") {
+  const parts = [`[${accountId}] slash command deploy rate limited`];
+  if (rateLimit.retryAfterMs !== undefined) {
     parts.push(
       `retry after ${formatDurationSeconds(rateLimit.retryAfterMs, {
         decimals: 1,
@@ -164,7 +246,7 @@ export function formatDiscordDeployRateLimitWarning(
   if (rateLimit.scope) {
     parts.push(`scope=${rateLimit.scope}`);
   }
-  if (typeof rateLimit.discordCode === "number" || typeof rateLimit.discordCode === "string") {
+  if (rateLimit.discordCode !== undefined) {
     parts.push(`code=${rateLimit.discordCode}`);
   }
   return `${parts.join("; ")}. Existing slash commands stay active. Message send/receive is unaffected.`;
@@ -211,6 +293,17 @@ function formatDiscordRejectedDeployEntries(params: {
   });
 }
 
+// Discord error envelopes are usually plain {message, code}; both already
+// appear via the error message and the code= detail, so repeating the JSON
+// body would only double the line length without adding information.
+function isRedundantDiscordDeployBody(rawBody: unknown): boolean {
+  if (!rawBody || typeof rawBody !== "object" || Array.isArray(rawBody)) {
+    return false;
+  }
+  const keys = Object.keys(rawBody);
+  return keys.length > 0 && keys.every((key) => key === "message" || key === "code");
+}
+
 export function formatDiscordDeployErrorDetails(err: unknown): string {
   if (!err || typeof err !== "object") {
     return "";
@@ -219,10 +312,12 @@ export function formatDiscordDeployErrorDetails(err: unknown): string {
   if (rateLimitDetails) {
     return rateLimitDetails;
   }
-  const status = (err as DiscordDeployErrorLike).status;
-  const discordCode = (err as DiscordDeployErrorLike).discordCode;
-  const rawBody = (err as DiscordDeployErrorLike).rawBody;
-  const requestBody = (err as DiscordDeployErrorLike).deployRequestBody;
+  const {
+    status,
+    discordCode,
+    rawBody,
+    deployRequestBody: requestBody,
+  } = err as DiscordDeployErrorLike;
   const details: string[] = [];
   if (typeof status === "number") {
     details.push(`status=${status}`);
@@ -230,8 +325,8 @@ export function formatDiscordDeployErrorDetails(err: unknown): string {
   if (typeof discordCode === "number" || typeof discordCode === "string") {
     details.push(`code=${discordCode}`);
   }
-  if (rawBody !== undefined) {
-    let bodyText = "";
+  if (rawBody !== undefined && !isRedundantDiscordDeployBody(rawBody)) {
+    let bodyText;
     try {
       bodyText = JSON.stringify(rawBody);
     } catch {
@@ -240,7 +335,8 @@ export function formatDiscordDeployErrorDetails(err: unknown): string {
     }
     if (bodyText) {
       const maxLen = 800;
-      const trimmed = bodyText.length > maxLen ? `${bodyText.slice(0, maxLen)}...` : bodyText;
+      const trimmed =
+        bodyText.length > maxLen ? `${truncateUtf16Safe(bodyText, maxLen)}...` : bodyText;
       details.push(`body=${trimmed}`);
     }
   }
@@ -256,8 +352,8 @@ export function isDiscordDeployDailyCreateLimit(err: unknown): boolean {
     return false;
   }
   const deployErr = err as DiscordDeployErrorLike;
-  const discordCode = readFiniteNumber(deployErr.discordCode);
-  const rawCode = readFiniteNumber(readDiscordDeployObjectField(deployErr.rawBody, "code"));
+  const discordCode = readNonNegativeInteger(deployErr.discordCode);
+  const rawCode = readNonNegativeInteger(readDiscordDeployObjectField(deployErr.rawBody, "code"));
   return (
     (discordCode === 30034 || rawCode === 30034) &&
     /daily application command creates/i.test(formatErrorMessage(err))

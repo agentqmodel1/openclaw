@@ -41,6 +41,8 @@ struct DiscoveryOutput: Encodable {
         var tailnetDns: String?
         var sshPort: Int
         var gatewayPort: Int?
+        var gatewayTls: Bool
+        var gatewayDirectReachable: Bool
         var cliPath: String?
         var stableID: String
         var debugID: String
@@ -106,20 +108,14 @@ func runDiscover(_ args: [String]) async {
                     tailnetDns: $0.tailnetDns,
                     sshPort: $0.sshPort,
                     gatewayPort: $0.gatewayPort,
+                    gatewayTls: $0.gatewayTls,
+                    gatewayDirectReachable: $0.gatewayDirectReachable,
                     cliPath: $0.cliPath,
                     stableID: $0.stableID,
                     debugID: $0.debugID,
                     isLocal: $0.isLocal)
             })
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        if let data = try? encoder.encode(payload),
-           let json = String(data: data, encoding: .utf8)
-        {
-            print(json)
-        } else {
-            print("{\"error\":\"failed to encode JSON\"}")
-        }
+        printCLIJSON(payload, fallback: "{\"error\":\"failed to encode JSON\"}")
         return
     }
 
@@ -139,6 +135,8 @@ func runDiscover(_ args: [String]) async {
         if let port = gateway.gatewayPort {
             print("  gatewayPort: \(port)")
         }
+        print("  gatewayTls: \(gateway.gatewayTls)")
+        print("  gatewayDirectReachable: \(gateway.gatewayDirectReachable)")
         if let cliPath = gateway.cliPath {
             print("  cliPath: \(cliPath)")
         }

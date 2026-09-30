@@ -1,5 +1,18 @@
-import type { ChannelDoctorLegacyConfigRule } from "openclaw/plugin-sdk/channel-contract";
+import type { PluginDoctorStateMigration } from "openclaw/plugin-sdk/runtime-doctor-migrations";
 
-// iMessage does not expose doctor legacy rules today. Keep that empty answer on
-// a lightweight contract surface so doctor scans stay off the full plugin path.
-export const legacyConfigRules: ChannelDoctorLegacyConfigRule[] = [];
+export { legacyConfigRules, normalizeCompatibilityConfig } from "./config-doctor-api.js";
+
+export const stateMigrations: PluginDoctorStateMigration[] = [
+  {
+    id: "imessage-legacy-state",
+    label: "iMessage legacy state",
+    async detectLegacyState(params) {
+      const { imessageRetiredStateMigration } = await import("./src/state-migrations.js");
+      return imessageRetiredStateMigration.detectLegacyState(params);
+    },
+    async migrateLegacyState(params) {
+      const { imessageRetiredStateMigration } = await import("./src/state-migrations.js");
+      return imessageRetiredStateMigration.migrateLegacyState(params);
+    },
+  },
+];

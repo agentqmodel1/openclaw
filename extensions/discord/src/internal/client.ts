@@ -1,106 +1,42 @@
-import type { APIApplicationCommand, APIInteraction } from "discord-api-types/v10";
+import type { APIInteraction } from "discord-api-types/v10";
+import type { DiscordCommandDeployHashStore } from "../command-deploy-store.js";
 import { DiscordCommandDeployer, type DeployCommandOptions } from "./command-deploy.js";
-import type { BaseCommand } from "./commands.js";
-import { BaseMessageInteractiveComponent, parseCustomId, type Modal } from "./components.js";
+import type { DiscordCommand } from "./commands.js";
+import { ComponentRegistry } from "./component-registry.js";
+import { BaseMessageInteractiveComponent, type Modal } from "./components.js";
 import { DiscordEntityCache } from "./entity-cache.js";
 import { DiscordEventQueue, type DiscordEventQueueOptions } from "./event-queue.js";
 import { dispatchInteraction } from "./interaction-dispatch.js";
+import type { GatewayPluginContract, VoicePluginContract } from "./plugin-contract.js";
 import { RequestClient, type RequestClientOptions } from "./rest.js";
 import type { Guild, GuildMember, User } from "./structures.js";
-
-export interface Route {
-  method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
-  path: `/${string}`;
-  handler(req: Request, ctx?: Context): Response | Promise<Response>;
-  protected?: boolean;
-  disabled?: boolean;
-}
-
-export interface Context {
-  waitUntil?(promise: Promise<unknown>): void;
-  env?: unknown;
-}
 
 export abstract class Plugin {
   abstract readonly id: string;
   registerClient?(client: Client): Promise<void> | void;
-  registerRoutes?(client: Client): Promise<void> | void;
-  onRequest?(req: Request, ctx: Context): Promise<Response | undefined> | Response | undefined;
 }
 
-export type AnyListener = {
+export type RegisteredPlugin = Plugin & (GatewayPluginContract | VoicePluginContract);
+
+type AnyListener = {
   type: string;
   handle(data: unknown, client: Client): Promise<void> | void;
 };
 
-export interface ClientOptions {
-  baseUrl: string;
+interface ClientOptions {
   clientId: string;
-  deploySecret?: string;
-  publicKey: string | string[];
   token: string;
   requestOptions?: RequestClientOptions;
-  autoDeploy?: boolean;
-  disableDeployRoute?: boolean;
-  disableInteractionsRoute?: boolean;
-  disableEventsRoute?: boolean;
+  commandDeployHashStore?: DiscordCommandDeployHashStore;
   devGuilds?: string[];
   eventQueue?: DiscordEventQueueOptions;
   restCacheTtlMs?: number;
 }
 
-export class ComponentRegistry<
-  T extends { customId: string; customIdParser?: typeof parseCustomId; type?: number },
-> {
-  private entries = new Map<string, T[]>();
-  private wildcardEntries: T[] = [];
-
-  register(entry: T): void {
-    const key = parseRegistryKey(entry.customId, entry.customIdParser);
-    if (key === "*") {
-      if (!this.wildcardEntries.includes(entry)) {
-        this.wildcardEntries.push(entry);
-      }
-      return;
-    }
-    const entries = this.entries.get(key) ?? [];
-    if (!entries.includes(entry)) {
-      entries.push(entry);
-      this.entries.set(key, entries);
-    }
-  }
-
-  resolve(customId: string, options?: { componentType?: number }): T | undefined {
-    for (const entries of this.entries.values()) {
-      const match = entries.find((entry) => {
-        if (options?.componentType !== undefined && entry.type !== options.componentType) {
-          return false;
-        }
-        const parser = entry.customIdParser ?? parseCustomId;
-        return parseRegistryKey(entry.customId, parser) === parseRegistryKey(customId, parser);
-      });
-      if (match) {
-        return match;
-      }
-    }
-    return this.wildcardEntries.find((entry) => {
-      if (options?.componentType !== undefined && entry.type !== options.componentType) {
-        return false;
-      }
-      return true;
-    });
-  }
-}
-
-function parseRegistryKey(customId: string, parser: typeof parseCustomId = parseCustomId): string {
-  return parser(customId).key;
-}
-
 export class Client {
-  routes: Route[] = [];
-  plugins: Array<{ id: string; plugin: Plugin }> = [];
+  plugins: RegisteredPlugin[] = [];
   options: ClientOptions;
-  commands: BaseCommand[];
+  commands: DiscordCommand[];
   listeners: AnyListener[];
   rest: RequestClient;
   componentHandler = new ComponentRegistry<BaseMessageInteractiveComponent>();
@@ -114,12 +50,12 @@ export class Client {
   constructor(
     options: ClientOptions,
     handlers: {
-      commands?: BaseCommand[];
+      commands?: DiscordCommand[];
       listeners?: AnyListener[];
       components?: BaseMessageInteractiveComponent[];
       modals?: Modal[];
     },
-    plugins: Plugin[] = [],
+    plugins: RegisteredPlugin[] = [],
   ) {
     if (!options.clientId) {
       throw new Error("Missing Discord application ID");
@@ -127,7 +63,7 @@ export class Client {
     if (!options.token) {
       throw new Error("Missing Discord bot token");
     }
-    this.options = { ...options, baseUrl: options.baseUrl.replace(/\/+$/, "") };
+    this.options = { ...options };
     this.commands = handlers.commands ?? [];
     this.listeners = handlers.listeners ?? [];
     this.rest = new RequestClient(options.token, options.requestOptions);
@@ -143,6 +79,7 @@ export class Client {
       clientId: this.options.clientId,
       commands: this.commands,
       devGuilds: this.options.devGuilds,
+      hashStore: this.options.commandDeployHashStore,
       rest: () => this.rest,
     });
     for (const component of handlers.components ?? []) {
@@ -158,13 +95,15 @@ export class Client {
     }
     for (const plugin of plugins) {
       void plugin.registerClient?.(this);
-      void plugin.registerRoutes?.(this);
-      this.plugins.push({ id: plugin.id, plugin });
+      this.plugins.push(plugin);
     }
   }
 
-  getPlugin<T = Plugin>(id: string): T | undefined {
-    return this.plugins.find((entry) => entry.id === id)?.plugin as T | undefined;
+  getPlugin(id: "gateway"): GatewayPluginContract | undefined;
+  getPlugin(id: "voice"): VoicePluginContract | undefined;
+  getPlugin(id: string): RegisteredPlugin | undefined;
+  getPlugin(id: string): RegisteredPlugin | undefined {
+    return this.plugins.find((plugin) => plugin.id === id);
   }
 
   registerListener(listener: AnyListener): AnyListener {
@@ -206,19 +145,15 @@ export class Client {
     return await this.entityCache.fetchMember(guildId, userId);
   }
 
-  async getDiscordCommands(): Promise<APIApplicationCommand[]> {
-    return await this.commandDeployer.getCommands();
+  async fetchGuildEmojis<T>(guildId: string, fetcher: () => Promise<T>): Promise<T> {
+    return await this.entityCache.fetchGuildEmojis(guildId, fetcher);
   }
 
   async deployCommands(options: DeployCommandOptions = {}) {
     return await this.commandDeployer.deploy(options);
   }
 
-  async reconcileCommands() {
-    return await this.deployCommands({ mode: "reconcile" });
-  }
-
-  async handleInteraction(rawData: APIInteraction, _ctx?: Context): Promise<void> {
+  async handleInteraction(rawData: APIInteraction): Promise<void> {
     await dispatchInteraction(this, rawData);
   }
 

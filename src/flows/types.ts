@@ -1,13 +1,14 @@
-export type FlowDocsLink = {
+// Shared option/contribution contracts for setup, onboarding, and doctor flow UIs.
+type FlowDocsLink = {
   path: string;
   label?: string;
 };
 
-export type FlowContributionKind = "channel" | "core" | "provider" | "search";
+type FlowContributionKind = "channel" | "core" | "provider" | "search";
 
-export type FlowContributionSurface = "auth-choice" | "health" | "model-picker" | "setup";
+type FlowContributionSurface = "auth-choice" | "health" | "model-picker" | "setup";
 
-export type FlowOptionGroup = {
+type FlowOptionGroup = {
   id: string;
   label: string;
   hint?: string;
@@ -20,9 +21,11 @@ export type FlowOption<Value extends string = string> = {
   group?: FlowOptionGroup;
   docs?: FlowDocsLink;
   assistantPriority?: number;
-  assistantVisibility?: "visible" | "manual-only";
+  assistantVisibility?: "visible" | "manual-only" | "detected-only";
+  modelTarget?: "utility";
 };
 
+/** Generic contribution envelope used by plugin/core setup surfaces. */
 export type FlowContribution<Value extends string = string> = {
   id: string;
   kind: FlowContributionKind;
@@ -31,10 +34,11 @@ export type FlowContribution<Value extends string = string> = {
   source?: string;
 };
 
+/** Sorts UI flow contributions deterministically by visible label, then value. */
 export function sortFlowContributionsByLabel<T extends FlowContribution>(
   contributions: readonly T[],
 ): T[] {
-  return [...contributions].toSorted(
+  return contributions.toSorted(
     (left, right) =>
       left.option.label.localeCompare(right.option.label) ||
       left.option.value.localeCompare(right.option.value),

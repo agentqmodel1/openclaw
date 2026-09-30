@@ -1,13 +1,7 @@
 import { createHash } from "node:crypto";
-import { ApplicationCommandType, type APIApplicationCommand } from "discord-api-types/v10";
-import {
-  createApplicationCommand,
-  deleteApplicationCommand,
-  editApplicationCommand,
-  listApplicationCommands,
-  overwriteApplicationCommands,
-  overwriteGuildApplicationCommands,
-} from "./api.js";
+import { ApplicationCommandType, Routes, type APIApplicationCommand } from "discord-api-types/v10";
+import type { DiscordCommandDeployHashStore } from "../command-deploy-store.js";
+import { commandsEqual, stableComparableObject } from "./command-comparison.js";
 import type { BaseCommand } from "./commands.js";
 import type { RequestClient } from "./rest.js";
 
@@ -18,21 +12,21 @@ export type DeployCommandOptions = {
 
 type SerializedCommand = ReturnType<BaseCommand["serialize"]>;
 
+const DISCORD_APPLICATION_COMMAND_LIMIT_REACHED = 30032;
+
 export class DiscordCommandDeployer {
   private readonly hashes = new Map<string, string>();
+  private readonly loadedKeys = new Set<string>();
 
   constructor(
     private readonly params: {
       clientId: string;
       commands: BaseCommand[];
       devGuilds?: string[];
+      hashStore?: DiscordCommandDeployHashStore;
       rest: () => RequestClient;
     },
   ) {}
-
-  async getCommands(): Promise<APIApplicationCommand[]> {
-    return await listApplicationCommands(this.rest, this.params.clientId);
-  }
 
   async deploy(options: DeployCommandOptions = {}) {
     const commands = this.params.commands.filter((command) => command.name !== "*");
@@ -40,16 +34,12 @@ export class DiscordCommandDeployer {
     const serializedGlobal = globalCommands.map((command) => command.serialize());
     for (const [guildId, entries] of groupGuildCommands(commands)) {
       await this.putCommandSetIfChanged(
-        `guild:${guildId}`,
+        this.scopedCacheKey(`guild:${guildId}`),
         entries,
-        async () => {
-          await overwriteGuildApplicationCommands(
-            this.rest,
-            this.params.clientId,
-            guildId,
-            entries,
-          );
-        },
+        () =>
+          this.rest.put(Routes.applicationGuildCommands(this.params.clientId, guildId), {
+            body: entries,
+          }),
         options,
       );
     }
@@ -57,62 +47,81 @@ export class DiscordCommandDeployer {
       for (const guildId of this.params.devGuilds) {
         const entries = commands.map((command) => command.serialize());
         await this.putCommandSetIfChanged(
-          `dev-guild:${guildId}`,
+          this.scopedCacheKey(`dev-guild:${guildId}`),
           entries,
-          async () => {
-            await overwriteGuildApplicationCommands(
-              this.rest,
-              this.params.clientId,
-              guildId,
-              entries,
-            );
-          },
+          () =>
+            this.rest.put(Routes.applicationGuildCommands(this.params.clientId, guildId), {
+              body: entries,
+            }),
           options,
         );
       }
       return { mode: options.mode ?? "reconcile", usedDevGuilds: true };
     }
-    if (options.mode !== "overwrite") {
-      await this.putCommandSetIfChanged(
-        "global:reconcile",
-        serializedGlobal,
-        async () => {
-          await this.reconcileGlobalCommands(serializedGlobal);
-        },
-        options,
-      );
-      return { mode: "reconcile" as const, usedDevGuilds: false };
-    }
+    const mode = options.mode === "overwrite" ? "overwrite" : "reconcile";
     await this.putCommandSetIfChanged(
-      "global:overwrite",
+      this.scopedCacheKey(`global:${mode}`),
       serializedGlobal,
-      async () => {
-        await overwriteApplicationCommands(this.rest, this.params.clientId, serializedGlobal);
-      },
+      () =>
+        mode === "overwrite"
+          ? this.rest.put(Routes.applicationCommands(this.params.clientId), {
+              body: serializedGlobal,
+            })
+          : this.reconcileGlobalCommands(serializedGlobal),
       options,
     );
-    return { mode: "overwrite" as const, usedDevGuilds: false };
+    return { mode, usedDevGuilds: false };
+  }
+
+  /**
+   * Scope cache keys by Discord application id so multi-bot setups that share a
+   * single command-deploy store still reconcile each application separately. The
+   * prior unscoped `global:reconcile` / `guild:<id>` keys let a later account
+   * with an identical command set reuse the first account's hash and skip its
+   * own application's reconcile entirely (#77359).
+   */
+  private scopedCacheKey(suffix: string): string {
+    return `app:${this.params.clientId}:${suffix}`;
   }
 
   private async reconcileGlobalCommands(desired: SerializedCommand[]) {
-    const existing = await this.getCommands();
+    // SAFETY: Discord's global-command list endpoint returns APIApplicationCommand[].
+    const existing = (await this.rest.get(
+      Routes.applicationCommands(this.params.clientId),
+    )) as APIApplicationCommand[];
     const existingByKey = new Map(existing.map((command) => [stableCommandKey(command), command]));
-    const desiredKeys = new Set<string>();
-    for (const command of desired) {
-      const key = stableCommandKey(command as APIApplicationCommand);
-      desiredKeys.add(key);
+    const desiredCommands = desired.map((command) => ({
+      command,
+      key: stableCommandKey(command),
+    }));
+    const desiredKeys = new Set(desiredCommands.map(({ key }) => key));
+    for (const { command, key } of desiredCommands) {
       const current = existingByKey.get(key);
-      if (!current) {
-        await createApplicationCommand(this.rest, this.params.clientId, command);
+      if (current && !commandsEqual(current, command)) {
+        await this.rest.patch(Routes.applicationCommand(this.params.clientId, current.id), {
+          body: command,
+        });
+      }
+    }
+    for (const { command, key } of desiredCommands) {
+      if (existingByKey.has(key)) {
         continue;
       }
-      if (!commandsEqual(current, command)) {
-        await editApplicationCommand(this.rest, this.params.clientId, current.id, command);
+      try {
+        await this.rest.post(Routes.applicationCommands(this.params.clientId), { body: command });
+      } catch (error) {
+        if (!isApplicationCommandLimitError(error)) {
+          throw error;
+        }
+        // Reconcile cannot create before deleting at Discord's hard cap. Bulk
+        // overwrite replaces the complete set without an unsafe delete gap.
+        await this.rest.put(Routes.applicationCommands(this.params.clientId), { body: desired });
+        return;
       }
     }
     for (const command of existing) {
       if (!desiredKeys.has(stableCommandKey(command))) {
-        await deleteApplicationCommand(this.rest, this.params.clientId, command.id);
+        await this.rest.delete(Routes.applicationCommand(this.params.clientId, command.id));
       }
     }
   }
@@ -120,15 +129,36 @@ export class DiscordCommandDeployer {
   private async putCommandSetIfChanged(
     key: string,
     commands: SerializedCommand[],
-    deploy: () => Promise<void>,
+    deploy: () => Promise<unknown>,
     options: { force?: boolean },
   ): Promise<void> {
     const hash = stableCommandSetHash(commands);
+    await this.loadPersistedHash(key);
     if (!options.force && this.hashes.get(key) === hash) {
       return;
     }
     await deploy();
     this.hashes.set(key, hash);
+    try {
+      await this.params.hashStore?.register(key, hash);
+    } catch {
+      // Cache persistence must not turn a successful Discord deploy into a startup failure.
+    }
+  }
+
+  private async loadPersistedHash(key: string): Promise<void> {
+    if (this.loadedKeys.has(key)) {
+      return;
+    }
+    this.loadedKeys.add(key);
+    try {
+      const hash = await this.params.hashStore?.lookup(key);
+      if (typeof hash === "string" && hash.trim()) {
+        this.hashes.set(key, hash);
+      }
+    } catch {
+      // Cache lookup failure is a miss. Reconcile repairs the canonical row after success.
+    }
   }
 
   private get rest(): RequestClient {
@@ -138,7 +168,7 @@ export class DiscordCommandDeployer {
 
 function groupGuildCommands(commands: BaseCommand[]): Map<string, SerializedCommand[]> {
   const guildCommands = new Map<string, SerializedCommand[]>();
-  for (const command of commands.filter((entry) => entry.guildIds)) {
+  for (const command of commands) {
     for (const guildId of command.guildIds ?? []) {
       const entries = guildCommands.get(guildId) ?? [];
       entries.push(command.serialize());
@@ -148,46 +178,17 @@ function groupGuildCommands(commands: BaseCommand[]): Map<string, SerializedComm
   return guildCommands;
 }
 
-function stableCommandKey(command: Pick<APIApplicationCommand, "name" | "type">) {
+function stableCommandKey(command: Pick<SerializedCommand, "name" | "type">) {
   return `${command.type ?? ApplicationCommandType.ChatInput}:${command.name}`;
 }
 
-function comparableCommand(value: unknown): unknown {
-  if (!value || typeof value !== "object") {
-    return value;
-  }
-  const omit = new Set([
-    "id",
-    "application_id",
-    "guild_id",
-    "version",
-    "default_permission",
-    "nsfw",
-  ]);
-  return stableComparableObject(
-    Object.fromEntries(
-      Object.entries(value).filter(([key, entry]) => !omit.has(key) && entry !== undefined),
-    ),
+function isApplicationCommandLimitError(error: unknown): boolean {
+  return (
+    error !== null &&
+    typeof error === "object" &&
+    "discordCode" in error &&
+    error.discordCode === DISCORD_APPLICATION_COMMAND_LIMIT_REACHED
   );
-}
-
-function stableComparableObject(value: unknown): unknown {
-  if (Array.isArray(value)) {
-    return value.map((entry) => stableComparableObject(entry));
-  }
-  if (!value || typeof value !== "object") {
-    return value;
-  }
-  return Object.fromEntries(
-    Object.entries(value as Record<string, unknown>)
-      .filter(([, entry]) => entry !== undefined)
-      .toSorted(([a], [b]) => a.localeCompare(b))
-      .map(([key, entry]) => [key, stableComparableObject(entry)]),
-  );
-}
-
-function commandsEqual(a: unknown, b: unknown) {
-  return JSON.stringify(comparableCommand(a)) === JSON.stringify(comparableCommand(b));
 }
 
 function stableCommandSetHash(commands: SerializedCommand[]): string {

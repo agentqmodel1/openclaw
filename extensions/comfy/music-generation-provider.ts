@@ -1,5 +1,4 @@
 import type {
-  GeneratedMusicAsset,
   MusicGenerationProvider,
   MusicGenerationSourceImage,
 } from "openclaw/plugin-sdk/music-generation";
@@ -10,18 +9,6 @@ import {
 } from "./workflow-runtime.js";
 
 const COMFY_MAX_INPUT_IMAGES = 1;
-
-function toGeneratedTrack(asset: {
-  buffer: Buffer;
-  mimeType: string;
-  fileName: string;
-}): GeneratedMusicAsset {
-  return {
-    buffer: asset.buffer,
-    mimeType: asset.mimeType,
-    fileName: asset.fileName,
-  };
-}
 
 function resolveInputImage(inputImage: MusicGenerationSourceImage | undefined) {
   if (!inputImage) {
@@ -69,13 +56,18 @@ export function buildComfyMusicGenerationProvider(): MusicGenerationProvider {
         authStore: req.authStore,
         prompt: req.prompt,
         model: req.model,
+        timeoutMs: req.timeoutMs,
         capability: "music",
         outputKinds: ["audio"],
         inputImage: resolveInputImage(req.inputImages?.[0]),
       });
 
       return {
-        tracks: result.assets.map(toGeneratedTrack),
+        tracks: result.assets.map(({ buffer, mimeType, fileName }) => ({
+          buffer,
+          mimeType,
+          fileName,
+        })),
         model: result.model,
         metadata: {
           promptId: result.promptId,

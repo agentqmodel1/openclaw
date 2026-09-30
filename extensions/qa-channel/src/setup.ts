@@ -1,11 +1,18 @@
-import type { OpenClawConfig } from "openclaw/plugin-sdk/config-types";
+import type { ChannelSetupInput } from "openclaw/plugin-sdk/channel-setup";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { DEFAULT_ACCOUNT_ID } from "./accounts.js";
 import type { CoreConfig } from "./types.js";
+
+export type QaChannelSetupInput = ChannelSetupInput & {
+  baseUrl?: string;
+  botUserId?: string;
+  botDisplayName?: string;
+};
 
 export function applyQaSetup(params: {
   cfg: OpenClawConfig;
   accountId: string;
-  input: Record<string, unknown>;
+  input: QaChannelSetupInput;
 }): OpenClawConfig {
   const nextCfg = structuredClone(params.cfg) as CoreConfig;
   const section = nextCfg.channels?.["qa-channel"] ?? {};

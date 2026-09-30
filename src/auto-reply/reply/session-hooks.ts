@@ -1,35 +1,48 @@
-import { resolveSessionAgentId } from "../../agents/agent-scope.js";
-import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import type { SessionFreshness } from "../../config/sessions/reset.js";
+import type { SessionEntry } from "../../config/sessions/types.js";
 import type {
   PluginHookSessionEndEvent,
   PluginHookSessionEndReason,
   PluginHookSessionStartEvent,
 } from "../../plugins/hook-types.js";
 
-export type SessionHookContext = {
+type ReplySessionEndReason = Extract<
+  PluginHookSessionEndReason,
+  "new" | "reset" | "idle" | "daily" | "unknown"
+>;
+
+export function resolveExplicitSessionEndReason(
+  matchedResetTriggerLower?: string,
+): Extract<ReplySessionEndReason, "new" | "reset"> {
+  return matchedResetTriggerLower === "/reset" ? "reset" : "new";
+}
+
+export function resolveStaleSessionEndReason(params: {
+  entry: SessionEntry | undefined;
+  freshness?: SessionFreshness;
+}): ReplySessionEndReason | undefined {
+  return params.entry ? params.freshness?.staleReason : undefined;
+}
+
+type SessionHookContext = {
   sessionId: string;
   sessionKey: string;
   agentId: string;
 };
 
-function buildSessionHookContext(params: {
-  sessionId: string;
-  sessionKey: string;
-  cfg: OpenClawConfig;
-}): SessionHookContext {
+function buildSessionHookContext(params: SessionHookContext): SessionHookContext {
   return {
     sessionId: params.sessionId,
     sessionKey: params.sessionKey,
-    agentId: resolveSessionAgentId({ sessionKey: params.sessionKey, config: params.cfg }),
+    agentId: params.agentId,
   };
 }
 
-export function buildSessionStartHookPayload(params: {
-  sessionId: string;
-  sessionKey: string;
-  cfg: OpenClawConfig;
-  resumedFrom?: string;
-}): {
+export function buildSessionStartHookPayload(
+  params: SessionHookContext & {
+    resumedFrom?: string;
+  },
+): {
   event: PluginHookSessionStartEvent;
   context: SessionHookContext;
 } {
@@ -39,26 +52,21 @@ export function buildSessionStartHookPayload(params: {
       sessionKey: params.sessionKey,
       resumedFrom: params.resumedFrom,
     },
-    context: buildSessionHookContext({
-      sessionId: params.sessionId,
-      sessionKey: params.sessionKey,
-      cfg: params.cfg,
-    }),
+    context: buildSessionHookContext(params),
   };
 }
 
-export function buildSessionEndHookPayload(params: {
-  sessionId: string;
-  sessionKey: string;
-  cfg: OpenClawConfig;
-  messageCount?: number;
-  durationMs?: number;
-  reason?: PluginHookSessionEndReason;
-  sessionFile?: string;
-  transcriptArchived?: boolean;
-  nextSessionId?: string;
-  nextSessionKey?: string;
-}): {
+export function buildSessionEndHookPayload(
+  params: SessionHookContext & {
+    messageCount?: number;
+    durationMs?: number;
+    reason?: PluginHookSessionEndReason;
+    sessionFile?: string;
+    transcriptArchived?: boolean;
+    nextSessionId?: string;
+    nextSessionKey?: string;
+  },
+): {
   event: PluginHookSessionEndEvent;
   context: SessionHookContext;
 } {
@@ -74,10 +82,6 @@ export function buildSessionEndHookPayload(params: {
       nextSessionId: params.nextSessionId,
       nextSessionKey: params.nextSessionKey,
     },
-    context: buildSessionHookContext({
-      sessionId: params.sessionId,
-      sessionKey: params.sessionKey,
-      cfg: params.cfg,
-    }),
+    context: buildSessionHookContext(params),
   };
 }

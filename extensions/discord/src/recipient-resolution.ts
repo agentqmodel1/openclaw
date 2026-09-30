@@ -1,10 +1,10 @@
-import type { OpenClawConfig } from "openclaw/plugin-sdk/config-types";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { requireRuntimeConfig } from "openclaw/plugin-sdk/plugin-config-runtime";
 import { resolveDiscordAccount } from "./accounts.js";
 import { parseAndResolveDiscordTarget } from "./target-resolver.js";
 import type { DiscordTargetParseOptions } from "./targets.js";
 
-type DiscordRecipient =
+export type DiscordRecipient =
   | {
       kind: "user";
       id: string;
@@ -34,6 +34,20 @@ export async function parseAndResolveRecipient(
       accountId: accountInfo.accountId,
     },
     parseOptions,
+  );
+  return { kind: resolved.kind, id: resolved.id };
+}
+
+export async function parseAndResolveChannelRecipient(
+  raw: string,
+  cfg: OpenClawConfig,
+  accountId: string,
+): Promise<DiscordRecipient> {
+  const resolvedCfg = requireRuntimeConfig(cfg, "Discord recipient resolution");
+  const resolved = await parseAndResolveDiscordTarget(
+    raw,
+    { cfg: resolvedCfg, accountId },
+    { defaultKind: "channel" },
   );
   return { kind: resolved.kind, id: resolved.id };
 }

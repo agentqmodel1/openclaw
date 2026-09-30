@@ -1,15 +1,26 @@
-import type { OpenClawConfig } from "openclaw/plugin-sdk/config-types";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import type { QaProviderMode } from "./model-selection.js";
+import type { QaMockProviderServer } from "./providers/shared/types.js";
 import type { QaTransportActionName, QaTransportAdapter } from "./qa-transport.js";
 
-export type QaRuntimeGatewayClient = {
+type QaRuntimeGatewayClient = {
+  readonly evidenceIdentity?: { protocol: number; version: string } | null;
   baseUrl: string;
   tempRoot: string;
   workspaceDir: string;
   runtimeEnv: NodeJS.ProcessEnv;
+  cliCommand?: {
+    executablePath: string;
+    argsPrefix: readonly string[];
+    cwd: string;
+  };
   getProcessCpuMs?: () => number | null;
   getProcessRssBytes?: () => number | null;
   logs?: () => string;
+  markLogs?: () => number;
+  readLogsSince?: (mark: number) => string;
+  restart?: () => Promise<void>;
+  stop?: (options?: { preserveToDir?: string }) => Promise<void>;
   restartAfterStateMutation?: (
     mutateState: (context: {
       configPath: string;
@@ -22,23 +33,21 @@ export type QaRuntimeGatewayClient = {
     method: string,
     params?: unknown,
     options?: {
+      expectFinal?: boolean;
       timeoutMs?: number;
     },
   ) => Promise<unknown>;
 };
 
-export type QaRuntimeTransport = QaTransportAdapter;
-
 export type QaSuiteRuntimeEnv = {
   gateway: QaRuntimeGatewayClient;
-  transport: QaRuntimeTransport;
+  outputDir: string;
+  transport: QaTransportAdapter;
   repoRoot: string;
   providerMode: QaProviderMode;
   primaryModel: string;
   alternateModel: string;
-  mock: {
-    baseUrl: string;
-  } | null;
+  mock: Pick<QaMockProviderServer, "baseUrl" | "holdNextContinuation"> | null;
   cfg: OpenClawConfig;
 };
 
@@ -71,6 +80,7 @@ export type QaDreamingStatus = {
 
 export type QaRawSessionStoreEntry = {
   sessionId?: string;
+  sessionFile?: string;
   status?: string;
   spawnedBy?: string;
   label?: string;

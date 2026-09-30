@@ -1,9 +1,8 @@
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { RuntimeEnv } from "../../runtime.js";
-import { normalizeLowercaseStringOrEmpty } from "../../shared/string-coerce.js";
 import type { ChannelId } from "./channel-id.types.js";
 import type { ChannelPairingAdapter } from "./pairing.types.js";
-import { getChannelPlugin, listChannelPlugins, normalizeChannelId } from "./registry.js";
+import { getChannelPlugin, listChannelPlugins } from "./registry.js";
 
 export function listPairingChannels(): ChannelId[] {
   // Channel docking: pairing support is declared via plugin.pairing.
@@ -17,7 +16,7 @@ export function getPairingAdapter(channelId: ChannelId): ChannelPairingAdapter |
   return plugin?.pairing ?? null;
 }
 
-export function requirePairingAdapter(channelId: ChannelId): ChannelPairingAdapter {
+function requirePairingAdapter(channelId: ChannelId): ChannelPairingAdapter {
   const adapter = getPairingAdapter(channelId);
   if (!adapter) {
     throw new Error(`Channel ${channelId} does not support pairing`);
@@ -25,28 +24,12 @@ export function requirePairingAdapter(channelId: ChannelId): ChannelPairingAdapt
   return adapter;
 }
 
-export function resolvePairingChannel(raw: unknown): ChannelId {
-  const value =
-    typeof raw === "string"
-      ? raw
-      : typeof raw === "number" || typeof raw === "boolean"
-        ? String(raw)
-        : "";
-  const normalizedValue = normalizeLowercaseStringOrEmpty(value);
-  const normalized = normalizeChannelId(normalizedValue);
-  const channels = listPairingChannels();
-  if (!normalized || !channels.includes(normalized)) {
-    throw new Error(
-      `Invalid channel: ${normalizedValue || "(empty)"} (expected one of: ${channels.join(", ")})`,
-    );
-  }
-  return normalized;
-}
-
 export async function notifyPairingApproved(params: {
   channelId: ChannelId;
   id: string;
   cfg: OpenClawConfig;
+  accountId?: string;
+  meta?: Record<string, string>;
   runtime?: RuntimeEnv;
   /** Extension channels can pass their adapter directly to bypass registry lookup. */
   pairingAdapter?: ChannelPairingAdapter;
@@ -59,6 +42,8 @@ export async function notifyPairingApproved(params: {
   await adapter.notifyApproval({
     cfg: params.cfg,
     id: params.id,
+    ...(params.accountId ? { accountId: params.accountId } : {}),
+    ...(params.meta ? { meta: params.meta } : {}),
     runtime: params.runtime,
   });
 }

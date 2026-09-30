@@ -1,5 +1,5 @@
 import { ChannelType } from "../internal/discord.js";
-import type { DiscordChannelInfoClient } from "./message-utils.js";
+import type { DiscordChannelInfoClient } from "./message-channel-info.js";
 import { resolveDiscordThreadLikeChannelContext } from "./thread-channel-context.js";
 
 type DiscordInteractionChannel = {
@@ -7,7 +7,7 @@ type DiscordInteractionChannel = {
   type?: ChannelType;
 };
 
-export type DiscordNativeInteractionChannelContext = {
+type DiscordNativeInteractionChannelContext = {
   channelType?: ChannelType;
   isDirectMessage: boolean;
   isGroupDm: boolean;

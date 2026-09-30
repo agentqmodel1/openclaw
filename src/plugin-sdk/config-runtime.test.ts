@@ -1,3 +1,6 @@
+/**
+ * Tests config runtime exports and snapshot/cache behavior exposed through the SDK.
+ */
 import { describe, expect, it } from "vitest";
 import {
   resolveLivePluginConfigObject,
@@ -24,6 +27,23 @@ describe("resolvePluginConfigObject", () => {
     expect(resolvePluginConfigObject(config, "demo-plugin")).toEqual({
       enabled: false,
       mode: "strict",
+    });
+  });
+
+  it("reads config through normalized plugin entry ids", () => {
+    const config = {
+      plugins: {
+        entries: {
+          " CODEX ": {
+            enabled: true,
+            config: { supervision: { enabled: true } },
+          },
+        },
+      },
+    } as unknown as OpenClawConfig;
+
+    expect(resolvePluginConfigObject(config, "codex")).toEqual({
+      supervision: { enabled: true },
     });
   });
 

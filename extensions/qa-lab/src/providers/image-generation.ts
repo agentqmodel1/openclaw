@@ -1,4 +1,12 @@
-import { QA_BASE_RUNTIME_PLUGIN_IDS } from "../qa-gateway-config.js";
+import {
+  normalizeTrimmedStringList,
+  uniqueStrings,
+} from "openclaw/plugin-sdk/string-coerce-runtime";
+import {
+  QA_BASE_RUNTIME_PLUGIN_IDS,
+  QA_CODEX_OPENAI_CATALOG_BASE_URL,
+} from "../qa-gateway-config.js";
+import type { RuntimeId } from "../runtime-id.js";
 import type { QaProviderMode } from "./index.js";
 import { getQaProvider } from "./index.js";
 
@@ -7,6 +15,7 @@ type QaImageGenerationPatchInput = {
   providerBaseUrl?: string;
   requiredPluginIds: readonly string[];
   existingPluginIds?: readonly string[];
+  forcedRuntime?: RuntimeId;
 };
 
 function splitModelProviderId(modelRef: string) {
@@ -15,9 +24,7 @@ function splitModelProviderId(modelRef: string) {
 }
 
 function uniqueNonEmpty(values: readonly (string | null | undefined)[]) {
-  return [
-    ...new Set(values.map((value) => value?.trim()).filter((value): value is string => !!value)),
-  ];
+  return uniqueStrings(normalizeTrimmedStringList(values));
 }
 
 export function buildQaImageGenerationConfigPatch(input: QaImageGenerationPatchInput) {
@@ -38,11 +45,33 @@ export function buildQaImageGenerationConfigPatch(input: QaImageGenerationPatchI
     if (!input.providerBaseUrl) {
       throw new Error(`QA provider "${input.providerMode}" requires a mock provider URL`);
     }
-    return provider.buildGatewayModels({
+    const gatewayModels = provider.buildGatewayModels({
       providerBaseUrl: input.providerBaseUrl,
     });
+    if (input.forcedRuntime !== "codex" || input.providerMode !== "mock-openai") {
+      return gatewayModels;
+    }
+    const openAiCatalog = gatewayModels?.providers.openai;
+    if (!openAiCatalog) {
+      throw new Error("forced Codex mock image QA requires the OpenAI mock catalog");
+    }
+    return {
+      mode: "merge" as const,
+      providers: {
+        openai: {
+          ...openAiCatalog,
+          baseUrl: QA_CODEX_OPENAI_CATALOG_BASE_URL,
+          request: undefined,
+          models: openAiCatalog.models.map((model) =>
+            model.id === "gpt-image-1"
+              ? Object.assign({}, model, { baseUrl: input.providerBaseUrl })
+              : model,
+          ),
+        },
+      },
+    };
   })();
-  const providerPluginIds = provider.usesModelProviderPlugins ? [imageProviderId] : [];
+  const providerPluginIds = imageProviderId ? [imageProviderId] : [];
   const enabledPluginIds = uniqueNonEmpty(providerPluginIds);
 
   return {
@@ -61,18 +90,13 @@ export function buildQaImageGenerationConfigPatch(input: QaImageGenerationPatchI
           }
         : {}),
     },
-    ...(modelPatch
-      ? {
-          models: {
-            mode: modelPatch.mode,
-            providers: modelPatch.providers,
-          },
-        }
-      : {}),
+    ...(modelPatch ? { models: modelPatch } : {}),
     agents: {
       defaults: {
-        imageGenerationModel: {
-          primary: imageModelRef,
+        mediaModels: {
+          image: {
+            primary: imageModelRef,
+          },
         },
       },
     },

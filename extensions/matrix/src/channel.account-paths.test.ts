@@ -1,33 +1,11 @@
+// Matrix tests cover channel.account paths plugin behavior.
+import { PAIRING_APPROVED_MESSAGE } from "openclaw/plugin-sdk/channel-status";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createMatrixPairingText, createMatrixProbeAccount } from "./channel-account-paths.js";
 
 const sendMessageMatrixMock = vi.hoisted(() => vi.fn());
 const probeMatrixMock = vi.hoisted(() => vi.fn());
 const resolveMatrixAuthMock = vi.hoisted(() => vi.fn());
-
-vi.mock("./matrix/send.js", async () => {
-  const actual = await vi.importActual<typeof import("./matrix/send.js")>("./matrix/send.js");
-  return {
-    ...actual,
-    sendMessageMatrix: (...args: unknown[]) => sendMessageMatrixMock(...args),
-  };
-});
-
-vi.mock("./matrix/probe.js", async () => {
-  const actual = await vi.importActual<typeof import("./matrix/probe.js")>("./matrix/probe.js");
-  return {
-    ...actual,
-    probeMatrix: (...args: unknown[]) => probeMatrixMock(...args),
-  };
-});
-
-vi.mock("./matrix/client.js", async () => {
-  const actual = await vi.importActual<typeof import("./matrix/client.js")>("./matrix/client.js");
-  return {
-    ...actual,
-    resolveMatrixAuth: (...args: unknown[]) => resolveMatrixAuthMock(...args),
-  };
-});
 
 describe("matrix account path propagation", () => {
   beforeEach(() => {
@@ -68,7 +46,7 @@ describe("matrix account path propagation", () => {
 
     expect(sendMessageMatrixMock).toHaveBeenCalledWith(
       "user:@user:example.org",
-      expect.any(String),
+      PAIRING_APPROVED_MESSAGE,
       { cfg: {}, accountId: "poe" },
     );
   });

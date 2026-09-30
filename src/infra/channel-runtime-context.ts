@@ -8,7 +8,7 @@ const NOOP_DISPOSE = () => {};
 function resolveScopedRuntimeContextRegistry(params: {
   channelRuntime: ChannelRuntimeSurface;
 }): ChannelRuntimeSurface["runtimeContexts"] {
-  const runtimeContexts = resolveRuntimeContextRegistry(params);
+  const runtimeContexts = params.channelRuntime?.runtimeContexts;
   if (
     runtimeContexts &&
     typeof runtimeContexts.register === "function" &&
@@ -22,12 +22,7 @@ function resolveScopedRuntimeContextRegistry(params: {
   );
 }
 
-function resolveRuntimeContextRegistry(params: {
-  channelRuntime?: ChannelRuntimeSurface;
-}): ChannelRuntimeSurface["runtimeContexts"] | null {
-  return params.channelRuntime?.runtimeContexts ?? null;
-}
-
+/** Registers a channel-scoped runtime context, returning null when no runtime registry exists. */
 export function registerChannelRuntimeContext(
   params: ChannelRuntimeContextKey & {
     channelRuntime?: ChannelRuntimeSurface;
@@ -35,7 +30,7 @@ export function registerChannelRuntimeContext(
     abortSignal?: AbortSignal;
   },
 ): { dispose: () => void } | null {
-  const runtimeContexts = resolveRuntimeContextRegistry(params);
+  const runtimeContexts = params.channelRuntime?.runtimeContexts;
   if (!runtimeContexts) {
     return null;
   }
@@ -48,30 +43,31 @@ export function registerChannelRuntimeContext(
   });
 }
 
-// oxlint-disable-next-line typescript/no-unnecessary-type-parameters -- Runtime context values are caller-typed by key.
-export function getChannelRuntimeContext<T = unknown>(
+/** Reads a channel-scoped runtime context from the current runtime registry. */
+export function getChannelRuntimeContext(
   params: ChannelRuntimeContextKey & {
     channelRuntime?: ChannelRuntimeSurface;
   },
-): T | undefined {
-  const runtimeContexts = resolveRuntimeContextRegistry(params);
+): unknown {
+  const runtimeContexts = params.channelRuntime?.runtimeContexts;
   if (!runtimeContexts) {
     return undefined;
   }
-  return runtimeContexts.get<T>({
+  return runtimeContexts.get({
     channelId: params.channelId,
     accountId: params.accountId,
     capability: params.capability,
   });
 }
 
+/** Watches context registration changes for one channel/account/capability key. */
 export function watchChannelRuntimeContexts(
   params: ChannelRuntimeContextKey & {
     channelRuntime?: ChannelRuntimeSurface;
     onEvent: Parameters<ChannelRuntimeSurface["runtimeContexts"]["watch"]>[0]["onEvent"];
   },
 ): (() => void) | null {
-  const runtimeContexts = resolveRuntimeContextRegistry(params);
+  const runtimeContexts = params.channelRuntime?.runtimeContexts;
   if (!runtimeContexts) {
     return null;
   }
@@ -83,10 +79,11 @@ export function watchChannelRuntimeContexts(
   });
 }
 
-export function createTaskScopedChannelRuntime(params: {
-  channelRuntime?: ChannelRuntimeSurface;
+/** Wraps a channel runtime so contexts registered during a task are disposed together. */
+export function createTaskScopedChannelRuntime<T extends ChannelRuntimeSurface>(params: {
+  channelRuntime?: T;
 }): {
-  channelRuntime?: ChannelRuntimeSurface;
+  channelRuntime?: T;
   dispose: () => void;
 } {
   const baseRuntime = params.channelRuntime;
@@ -99,31 +96,24 @@ export function createTaskScopedChannelRuntime(params: {
   const runtimeContexts = resolveScopedRuntimeContextRegistry({ channelRuntime: baseRuntime });
 
   const trackedLeases = new Set<{ dispose: () => void }>();
-  const trackLease = (lease: { dispose: () => void }) => {
-    trackedLeases.add(lease);
-    let disposed = false;
-    return {
-      dispose: () => {
-        if (disposed) {
-          return;
-        }
-        disposed = true;
-        trackedLeases.delete(lease);
-        lease.dispose();
-      },
-    };
-  };
-
-  const scopedRuntime: ChannelRuntimeSurface = {
+  const scopedRuntime = {
     ...baseRuntime,
     runtimeContexts: {
       ...runtimeContexts,
       register: (registerParams) => {
         const lease = runtimeContexts.register(registerParams);
-        return trackLease(lease);
+        const trackedLease = {
+          dispose: () => {
+            if (trackedLeases.delete(trackedLease)) {
+              lease.dispose();
+            }
+          },
+        };
+        trackedLeases.add(trackedLease);
+        return trackedLease;
       },
     },
-  };
+  } as T;
 
   return {
     channelRuntime: scopedRuntime,

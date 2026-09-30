@@ -1,10 +1,11 @@
+// Runtime contracts for approval handlers used by execution requests.
 import type {
   ChannelApprovalCapability,
   ChannelApprovalNativeAdapter,
 } from "../channels/plugins/types.adapters.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
-import { resolveApprovalOverGateway } from "./approval-gateway-resolver.js";
+import { canChannelEnforcePluginReviewerPolicy } from "./approval-channel-policy-support.js";
 import {
   CHANNEL_APPROVAL_NATIVE_RUNTIME_CONTEXT_CAPABILITY,
   createLazyChannelApprovalNativeRuntimeAdapter,
@@ -23,20 +24,18 @@ import type {
   ChannelNativeApprovalTransportSpec,
 } from "./approval-native-runtime-types.js";
 import { createChannelNativeApprovalRuntime } from "./approval-native-runtime.js";
+import { normalizeApprovalRequest } from "./approval-types.js";
 import {
   buildExpiredApprovalView,
   buildPendingApprovalView,
   buildResolvedApprovalView,
 } from "./approval-view-model.js";
 import type {
-  ApprovalActionView,
-  ApprovalMetadataView,
   ExpiredApprovalView,
   PendingApprovalView,
   ResolvedApprovalView,
 } from "./approval-view-model.types.js";
 import type { ExecApprovalChannelRuntime } from "./exec-approval-channel-runtime.js";
-import type { ExecApprovalChannelRuntimeEventKind } from "./exec-approval-channel-runtime.types.js";
 
 export type {
   ApprovalActionView,
@@ -52,16 +51,12 @@ export type {
   PluginApprovalResolvedView,
   ResolvedApprovalView,
 } from "./approval-view-model.types.js";
-export { resolveApprovalOverGateway };
 export {
   CHANNEL_APPROVAL_NATIVE_RUNTIME_CONTEXT_CAPABILITY,
   createLazyChannelApprovalNativeRuntimeAdapter,
 };
 export type {
-  ApprovalRequest,
-  ApprovalResolved,
   ChannelApprovalCapabilityHandlerContext,
-  ChannelApprovalKind,
   ChannelApprovalNativeAvailabilityAdapter,
   ChannelApprovalNativeFinalAction,
   ChannelApprovalNativeInteractionAdapter,
@@ -92,35 +87,6 @@ type WrappedPendingContent = {
   view: PendingApprovalView;
   payload: unknown;
 };
-
-function consumeActiveWrappedEntries(
-  activeEntries: Map<string, ActiveApprovalEntries>,
-  requestId: string,
-  fallbackEntries: WrappedPendingEntry[],
-): WrappedPendingEntry[] {
-  const entries = activeEntries.get(requestId)?.entries ?? fallbackEntries;
-  activeEntries.delete(requestId);
-  return entries;
-}
-
-async function finalizeWrappedEntries(params: {
-  entries: WrappedPendingEntry[];
-  phase: "resolved" | "expired";
-  request: ApprovalRequest;
-  log: ReturnType<typeof createSubsystemLogger>;
-  runEntry: (wrapped: WrappedPendingEntry) => Promise<void>;
-}): Promise<void> {
-  for (const wrapped of params.entries) {
-    try {
-      await params.runEntry(wrapped);
-    } catch (error) {
-      params.log.error(
-        `failed to finalize ${params.phase} native approval entry ` +
-          `approval=${params.request.id}: ${String(error)}`,
-      );
-    }
-  }
-}
 
 async function unbindWrappedEntries(params: {
   entries: WrappedPendingEntry[];
@@ -158,6 +124,8 @@ async function applyApprovalFinalAction(params: {
   nativeRuntime: ChannelApprovalNativeRuntimeAdapter;
   baseContext: ChannelApprovalCapabilityHandlerContext;
   wrapped: WrappedPendingEntry;
+  request: ApprovalRequest;
+  approvalKind: ChannelApprovalKind;
   result: ChannelApprovalNativeFinalAction<unknown>;
   phase: "resolved" | "expired";
 }): Promise<void> {
@@ -166,6 +134,8 @@ async function applyApprovalFinalAction(params: {
       await params.nativeRuntime.transport.updateEntry?.({
         ...params.baseContext,
         entry: params.wrapped.entry,
+        request: params.request,
+        approvalKind: params.approvalKind,
         payload: params.result.payload,
         phase: params.phase,
       });
@@ -183,12 +153,13 @@ async function applyApprovalFinalAction(params: {
         entry: params.wrapped.entry,
         phase: params.phase,
       });
-      return;
+
+    // `clear-actions` updates interaction controls but leaves the delivered content in place.
     case "leave":
-      return;
   }
 }
 
+/** Adapts a strongly typed channel native approval spec into the erased runtime contract. */
 export function createChannelApprovalNativeRuntimeAdapter<
   TPendingPayload,
   TPreparedTarget,
@@ -239,6 +210,8 @@ export function createChannelApprovalNativeRuntimeAdapter<
             updateEntry: async (
               params: {
                 entry: unknown;
+                request: ApprovalRequest;
+                approvalKind: ChannelApprovalKind;
                 payload: unknown;
                 phase: "resolved" | "expired";
               } & ChannelApprovalCapabilityHandlerContext,
@@ -277,6 +250,12 @@ export function createChannelApprovalNativeRuntimeAdapter<
                     await spec.interactions?.clearPendingActions?.(params as never),
                 }
               : {}),
+            ...(spec.interactions.cancelDelivered
+              ? {
+                  cancelDelivered: async (params) =>
+                    await spec.interactions?.cancelDelivered?.(params as never),
+                }
+              : {}),
           },
         }
       : {}),
@@ -299,29 +278,38 @@ export function createChannelApprovalNativeRuntimeAdapter<
                   onDelivered: (params) => spec.observe?.onDelivered?.(params as never),
                 }
               : {}),
+            ...(spec.observe.onFinalized
+              ? {
+                  onFinalized: (params) => {
+                    // SAFETY: The factory preserves the request and lifecycle types for this adapter.
+                    return spec.observe?.onFinalized?.(params as never);
+                  },
+                }
+              : {}),
           },
         }
       : {}),
   };
 }
 
-export type ChannelApprovalHandlerRuntimeSpec<TRequest extends ApprovalRequest> = {
+type ChannelApprovalHandlerRuntimeSpec<TRequest extends ApprovalRequest> = {
   label: string;
   clientDisplayName: string;
   cfg: OpenClawConfig;
   gatewayUrl?: string;
-  eventKinds?: readonly ExecApprovalChannelRuntimeEventKind[];
+  eventKinds?: readonly ChannelApprovalKind[];
   channel?: string;
   channelLabel?: string;
   accountId?: string | null;
   nativeAdapter?: ChannelApprovalNativeAdapter | null;
+  /** @deprecated Trusted compatibility override; omit to derive ownership from the payload. */
   resolveApprovalKind?: (request: TRequest) => ChannelApprovalKind;
   isConfigured: () => boolean;
   shouldHandle: (request: TRequest) => boolean;
   nowMs?: () => number;
 };
 
-export type ChannelApprovalHandlerContentSpec<
+type ChannelApprovalHandlerContentSpec<
   TPendingContent,
   TRequest extends ApprovalRequest = ApprovalRequest,
 > = {
@@ -332,14 +320,7 @@ export type ChannelApprovalHandlerContentSpec<
   }) => TPendingContent | Promise<TPendingContent>;
 };
 
-export type ChannelApprovalHandlerTransportSpec<
-  TPendingEntry,
-  TPreparedTarget,
-  TPendingContent,
-  TRequest extends ApprovalRequest = ApprovalRequest,
-> = ChannelNativeApprovalTransportSpec<TPendingEntry, TPreparedTarget, TPendingContent, TRequest>;
-
-export type ChannelApprovalHandlerLifecycleSpec<
+type ChannelApprovalHandlerLifecycleSpec<
   TPendingEntry,
   TPreparedTarget,
   TPendingContent,
@@ -360,6 +341,7 @@ export type ChannelApprovalHandlerLifecycleSpec<
   onStopped?: () => Promise<void> | void;
 };
 
+/** Adapter contract used by core to run a channel's native approval delivery lifecycle. */
 export type ChannelApprovalHandlerAdapter<
   TPendingEntry,
   TPreparedTarget,
@@ -369,7 +351,7 @@ export type ChannelApprovalHandlerAdapter<
 > = {
   runtime: ChannelApprovalHandlerRuntimeSpec<TRequest>;
   content: ChannelApprovalHandlerContentSpec<TPendingContent, TRequest>;
-  transport: ChannelApprovalHandlerTransportSpec<
+  transport: ChannelNativeApprovalTransportSpec<
     TPendingEntry,
     TPreparedTarget,
     TPendingContent,
@@ -384,6 +366,7 @@ export type ChannelApprovalHandlerAdapter<
   >;
 };
 
+/** Creates the shared approval handler runtime from channel-specific content and transport hooks. */
 export function createChannelApprovalHandler<
   TPendingEntry,
   TPreparedTarget,
@@ -415,7 +398,9 @@ export function createChannelApprovalHandler<
     channelLabel: adapter.runtime.channelLabel,
     accountId: adapter.runtime.accountId,
     nativeAdapter: adapter.runtime.nativeAdapter,
-    resolveApprovalKind: adapter.runtime.resolveApprovalKind,
+    ...(adapter.runtime.resolveApprovalKind
+      ? { resolveApprovalKind: adapter.runtime.resolveApprovalKind }
+      : {}),
     isConfigured: adapter.runtime.isConfigured,
     shouldHandle: adapter.runtime.shouldHandle,
     nowMs: adapter.runtime.nowMs,
@@ -431,8 +416,12 @@ export function createChannelApprovalHandler<
   });
 }
 
+/** Builds a shared approval handler from a plugin approval capability, or null when unsupported. */
 export async function createChannelApprovalHandlerFromCapability(params: {
-  capability?: Pick<ChannelApprovalCapability, "native" | "nativeRuntime"> | null;
+  capability?: Pick<
+    ChannelApprovalCapability,
+    "native" | "nativeRuntime" | "supportsScopedPluginApprovalApprovers"
+  > | null;
   label: string;
   clientDisplayName: string;
   channel: string;
@@ -449,15 +438,81 @@ export async function createChannelApprovalHandlerFromCapability(params: {
   }
   const log = createSubsystemLogger(params.label);
   const activeEntries = new Map<string, ActiveApprovalEntries>();
-  const resolveApprovalKind =
-    nativeRuntime.resolveApprovalKind ??
-    ((request: ApprovalRequest) =>
-      request.id.startsWith("plugin:") ? "plugin" : ("exec" as const));
+  let stopped = false;
+  const resolveApprovalKind = (request: ApprovalRequest): ChannelApprovalKind => {
+    const normalizedRequest = normalizeApprovalRequest(request);
+    return nativeRuntime.resolveApprovalKind?.(normalizedRequest) ?? normalizedRequest.approvalKind;
+  };
   const baseContext: ChannelApprovalCapabilityHandlerContext = {
     cfg: params.cfg,
     accountId: params.accountId,
     gatewayUrl: params.gatewayUrl,
     context: params.context,
+  };
+  const finalize = async (
+    request: ApprovalRequest,
+    entries: WrappedPendingEntry[],
+    outcome: { phase: "resolved"; resolved: ApprovalResolved } | { phase: "expired" },
+  ): Promise<void> => {
+    const active = activeEntries.get(request.id)?.entries ?? entries;
+    activeEntries.delete(request.id);
+    const approvalKind = resolveApprovalKind(request);
+    let buildResult: (
+      entry: unknown,
+    ) => ReturnType<ChannelApprovalNativeRuntimeAdapter["presentation"]["buildResolvedResult"]>;
+    if (outcome.phase === "resolved") {
+      const view = buildResolvedApprovalView(request, outcome.resolved);
+      buildResult = (entry) =>
+        nativeRuntime.presentation.buildResolvedResult({
+          ...baseContext,
+          request,
+          resolved: outcome.resolved,
+          view,
+          entry,
+        });
+    } else {
+      const view = buildExpiredApprovalView(request);
+      buildResult = (entry) =>
+        nativeRuntime.presentation.buildExpiredResult({
+          ...baseContext,
+          request,
+          view,
+          entry,
+        });
+    }
+    for (const wrapped of active) {
+      try {
+        if (wrapped.binding !== undefined) {
+          await nativeRuntime.interactions?.unbindPending?.({
+            ...baseContext,
+            entry: wrapped.entry,
+            binding: wrapped.binding,
+            request,
+            approvalKind,
+          });
+        }
+        await applyApprovalFinalAction({
+          nativeRuntime,
+          baseContext,
+          wrapped,
+          request,
+          approvalKind,
+          result: await buildResult(wrapped.entry),
+          phase: outcome.phase,
+        });
+      } catch (error) {
+        log.error(
+          `failed to finalize ${outcome.phase} native approval entry ` +
+            `approval=${request.id}: ${String(error)}`,
+        );
+      }
+    }
+    nativeRuntime.observe?.onFinalized?.({
+      ...baseContext,
+      request,
+      approvalKind,
+      phase: outcome.phase,
+    });
   };
   return createChannelApprovalHandler<WrappedPendingEntry, unknown, WrappedPendingContent>({
     runtime: {
@@ -470,10 +525,24 @@ export async function createChannelApprovalHandlerFromCapability(params: {
       gatewayUrl: params.gatewayUrl,
       eventKinds: nativeRuntime.eventKinds,
       nativeAdapter: params.capability?.native as ChannelApprovalNativeAdapter | null,
-      resolveApprovalKind,
+      ...(nativeRuntime.resolveApprovalKind
+        ? { resolveApprovalKind: nativeRuntime.resolveApprovalKind }
+        : {}),
       isConfigured: () => nativeRuntime.availability.isConfigured(baseContext),
-      shouldHandle: (request) =>
-        nativeRuntime.availability.shouldHandle({ ...baseContext, request }),
+      shouldHandle: (request) => {
+        const approvalKind = resolveApprovalKind(request);
+        if (
+          approvalKind === "plugin" &&
+          !canChannelEnforcePluginReviewerPolicy(params.cfg, params.channel, params.capability)
+        ) {
+          return false;
+        }
+        return nativeRuntime.availability.shouldHandle({
+          ...baseContext,
+          request,
+          approvalKind,
+        });
+      },
       nowMs: params.nowMs,
     },
     content: {
@@ -521,6 +590,21 @@ export async function createChannelApprovalHandlerFromCapability(params: {
         if (!entry) {
           return null;
         }
+        if (stopped) {
+          // onStopped fired between deliverPending and bindPending. The wrapped
+          // entry is not yet in activeEntries, so there is no map leak, but
+          // adapters that register side-effects inside deliverPending (e.g. the
+          // Matrix reaction target store) need explicit cleanup. unbindPending
+          // would violate its contract without a binding, so route cleanup
+          // through the optional cancelDelivered hook, which takes the entry.
+          await nativeRuntime.interactions?.cancelDelivered?.({
+            ...baseContext,
+            entry,
+            request,
+            approvalKind,
+          });
+          return null;
+        }
         const binding = await nativeRuntime.interactions?.bindPending?.({
           ...baseContext,
           entry,
@@ -529,6 +613,29 @@ export async function createChannelApprovalHandlerFromCapability(params: {
           view: pendingContent.view,
           pendingPayload: pendingContent.payload,
         });
+        if (stopped) {
+          if (binding !== undefined && binding !== null) {
+            await nativeRuntime.interactions?.unbindPending?.({
+              ...baseContext,
+              entry,
+              binding,
+              request,
+              approvalKind,
+            });
+          } else {
+            // bindPending returned without a binding handle, but deliverPending
+            // may have left side-effects. Adapters that wire the same store
+            // from both deliverPending and bindPending (e.g. Matrix) drain it
+            // via the binding branch above; this branch covers the rest.
+            await nativeRuntime.interactions?.cancelDelivered?.({
+              ...baseContext,
+              entry,
+              request,
+              approvalKind,
+            });
+          }
+          return null;
+        }
         const wrapped: WrappedPendingEntry = {
           entry,
           ...(binding === undefined || binding === null ? {} : { binding }),
@@ -591,80 +698,11 @@ export async function createChannelApprovalHandlerFromCapability(params: {
           entry: entry.entry,
         });
       },
-      finalizeResolved: async ({ request, resolved, entries }) => {
-        const resolvedEntries = consumeActiveWrappedEntries(activeEntries, request.id, entries);
-        const view = buildResolvedApprovalView(request, resolved);
-        await finalizeWrappedEntries({
-          entries: resolvedEntries,
-          phase: "resolved",
-          request,
-          log,
-          runEntry: async (wrapped) => {
-            if (wrapped.binding !== undefined) {
-              await nativeRuntime.interactions?.unbindPending?.({
-                ...baseContext,
-                entry: wrapped.entry,
-                binding: wrapped.binding,
-                request,
-                approvalKind: resolveApprovalKind(request),
-              });
-            }
-            const result = await nativeRuntime.presentation.buildResolvedResult({
-              ...baseContext,
-              request,
-              resolved,
-              view,
-              entry: wrapped.entry,
-            });
-            await applyApprovalFinalAction({
-              nativeRuntime,
-              baseContext,
-              wrapped,
-              result,
-              phase: "resolved",
-            });
-          },
-        });
-      },
-      finalizeExpired: async ({ request, entries }) => {
-        const expiredEntries = consumeActiveWrappedEntries(activeEntries, request.id, entries);
-        const view = buildExpiredApprovalView(request);
-        await finalizeWrappedEntries({
-          entries: expiredEntries,
-          phase: "expired",
-          request,
-          log,
-          runEntry: async (wrapped) => {
-            if (wrapped.binding !== undefined) {
-              await nativeRuntime.interactions?.unbindPending?.({
-                ...baseContext,
-                entry: wrapped.entry,
-                binding: wrapped.binding,
-                request,
-                approvalKind: resolveApprovalKind(request),
-              });
-            }
-            const result = await nativeRuntime.presentation.buildExpiredResult({
-              ...baseContext,
-              request,
-              view,
-              entry: wrapped.entry,
-            });
-            await applyApprovalFinalAction({
-              nativeRuntime,
-              baseContext,
-              wrapped,
-              result,
-              phase: "expired",
-            });
-          },
-        });
-      },
+      finalizeResolved: ({ request, resolved, entries }) =>
+        finalize(request, entries, { phase: "resolved", resolved }),
+      finalizeExpired: ({ request, entries }) => finalize(request, entries, { phase: "expired" }),
       onStopped: async () => {
-        if (activeEntries.size === 0) {
-          activeEntries.clear();
-          return;
-        }
+        stopped = true;
         for (const activeRequest of activeEntries.values()) {
           await unbindWrappedEntries({
             entries: activeRequest.entries,

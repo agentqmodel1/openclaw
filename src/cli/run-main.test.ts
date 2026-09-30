@@ -1,310 +1,220 @@
-import { describe, expect, it } from "vitest";
-import type { PluginManifestCommandAliasRegistry } from "../plugins/manifest-command-aliases.js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  resolveManifestCommandAliasOwnerInRegistry,
+  resolveManifestToolOwnerInRegistry,
+  type PluginManifestCommandAliasRegistry,
+} from "../plugins/manifest-command-aliases.js";
+import {
+  resolveGatewayCatalogCommandPath,
+  resolveGatewayRunPreBootstrapOptions,
+} from "./gateway-run-argv.js";
+import {
+  isGatewayRunFastPathArgv,
   rewriteUpdateFlagArgv,
   resolveMissingPluginCommandMessage,
-  shouldEnsureCliPath,
-  shouldStartCrestodianForBareRoot,
-  shouldStartCrestodianForModernOnboard,
+  shouldHandleBareRoot,
   shouldStartProxyForCli,
-  shouldUseBrowserHelpFastPath,
   shouldUseRootHelpFastPath,
+  shouldUseSetupOnboardConfigureHelpFastPath,
 } from "./run-main-policy.js";
-import { isGatewayRunFastPathArgv } from "./run-main.js";
+import { runCli } from "./run-main.js";
 
-const memoryWikiCommandAliasRegistry: PluginManifestCommandAliasRegistry = {
-  plugins: [
+const cliArgs = (...args: string[]) => ["node", "openclaw", ...args];
+const runGatewayCommand = vi.hoisted(() => vi.fn());
+vi.mock("./gateway-cli/run.js", () => ({ runGatewayCommand }));
+// Keep Commander parsing independent of native startup; run-main.exit and
+// command-execution-startup tests own bootstrap and admission behavior.
+vi.mock("./gateway-cli/pre-bootstrap.js", () => ({
+  selectGatewayRunEnvironment: async () => true,
+  prepareGatewayRunBootstrap: async () => false,
+  recheckGatewayRunBootstrap: async () => {
+    throw new Error("Commander parsing fixture unexpectedly rechecked Gateway bootstrap");
+  },
+  reloadTrustedGatewayRunEnvironment: async () => {
+    throw new Error("Commander parsing fixture unexpectedly reloaded Gateway environment");
+  },
+}));
+vi.mock("../state/agent-database-startup.js", () => ({
+  withAgentDatabaseStartupAdmission: <T>(run: () => Promise<T>) => run(),
+}));
+vi.mock("./command-execution-startup.js", () => ({
+  ensureCliExecutionBootstrap: async () => {
+    throw new Error("Commander parsing fixture unexpectedly entered CLI bootstrap");
+  },
+}));
+vi.mock("../logging/console.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../logging/console.js")>()),
+  enableConsoleCapture: vi.fn(),
+}));
+
+describe("Gateway fast-path Commander parsing", () => {
+  const previousExitCode = process.exitCode;
+  beforeEach(() => {
+    process.exitCode = undefined;
+    runGatewayCommand.mockClear();
+    vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+  });
+  afterEach(() => {
+    process.exitCode = previousExitCode;
+    vi.restoreAllMocks();
+  });
+
+  it.each([
+    ["--update-canary", "--no-color", "run"],
+    ["run", "--update-canary", "--no-color"],
+  ])("accepts no-color beside a boolean flag: %j", async (...args) => {
+    await runCli(cliArgs("gateway", ...args, "--token=--no-color"));
+    expect(process.exitCode).toBeUndefined();
+    expect(runGatewayCommand).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ updateCanary: true, token: "--no-color" }),
+      expect.any(Object),
+    );
+  });
+});
+
+describe("Gateway argv boundaries", () => {
+  it("matches only plain foreground starts without root options or help", () => {
+    expect(isGatewayRunFastPathArgv(cliArgs("gateway"))).toBe(true);
+    expect(isGatewayRunFastPathArgv(cliArgs("gateway", "--force"))).toBe(true);
+    expect(isGatewayRunFastPathArgv(cliArgs("gateway", "--port", "18789"))).toBe(true);
+    expect(isGatewayRunFastPathArgv(cliArgs("gateway", "--auth=none"))).toBe(true);
+    expect(isGatewayRunFastPathArgv(cliArgs("--no-color", "gateway", "--bind", "loopback"))).toBe(
+      true,
+    );
+    expect(isGatewayRunFastPathArgv(cliArgs("gateway", "run"))).toBe(true);
+    expect(isGatewayRunFastPathArgv(cliArgs("gateway", "--log-level", "debug", "run"))).toBe(false);
+    expect(isGatewayRunFastPathArgv(cliArgs("gateway", "call", "health"))).toBe(false);
+    expect(isGatewayRunFastPathArgv(cliArgs("gateway", "--help"))).toBe(false);
+    expect(isGatewayRunFastPathArgv(cliArgs("gateway", "--port"))).toBe(false);
+    expect(isGatewayRunFastPathArgv(cliArgs("gateway", "--unknown"))).toBe(false);
+    expect(isGatewayRunFastPathArgv(cliArgs("gateway", "--update-canary=true"))).toBe(false);
+  });
+
+  it("resolves destructive flags after root options without consuming option values", () => {
+    expect(
+      resolveGatewayRunPreBootstrapOptions(
+        cliArgs("--log-level", "debug", "gateway", "run", "--force", "--reset"),
+      ),
+    ).toEqual({ force: true, reset: true });
+    expect(resolveGatewayRunPreBootstrapOptions(cliArgs("gateway", "--token", "--force"))).toEqual({
+      force: false,
+      reset: false,
+    });
+  });
+
+  it.each([
+    { args: ["--", "gateway", "--force"], commandPath: ["gateway", "--force"] },
+    { args: ["gateway", "--", "run", "--force"], commandPath: ["gateway", "run"] },
+    { args: ["gateway", "run", "--", "--reset"], commandPath: ["gateway", "run"] },
+  ])("preserves literal commands without destructive flags: $args", ({ args, commandPath }) => {
+    const argv = cliArgs(...args);
+    expect(resolveGatewayCatalogCommandPath(argv)).toEqual(commandPath);
+    const options = resolveGatewayRunPreBootstrapOptions(argv);
+    expect(options?.force).not.toBe(true);
+    expect(options?.reset).not.toBe(true);
+  });
+});
+
+describe("root startup policy", () => {
+  it.each([
+    { args: ["--profile", "p", "--update"], expected: ["--profile", "p", "update"] },
+    { args: ["--", "--update"], expected: ["--", "--update"] },
     {
-      id: "memory-wiki",
-      commandAliases: [{ name: "wiki" }],
+      args: ["config", "set", "update.channel", "--update"],
+      expected: ["config", "set", "update.channel", "--update"],
     },
-  ],
-};
+  ])("rewrites only a root update flag: $args", ({ args, expected }) => {
+    expect(rewriteUpdateFlagArgv(cliArgs(...args))).toEqual(cliArgs(...expected));
+  });
 
-const memoryCoreCommandAliasRegistry: PluginManifestCommandAliasRegistry = {
-  plugins: [
-    {
-      id: "memory-core",
-      commandAliases: [{ name: "dreaming", kind: "runtime-slash", cliCommand: "memory" }],
+  it.each([["--profile", "work", "--", "config", "get", "gateway.mode"]])(
+    "does not launch bare-root flows for literal commands: %j",
+    (...args) => {
+      const argv = cliArgs(...args);
+      expect(shouldHandleBareRoot(argv)).toBe(false);
+      expect(shouldUseRootHelpFastPath(argv)).toBe(false);
     },
-  ],
-};
+  );
 
-describe("isGatewayRunFastPathArgv", () => {
-  it("matches only plain gateway foreground starts without root options or help", () => {
-    expect(isGatewayRunFastPathArgv(["node", "openclaw", "gateway"])).toBe(true);
-    expect(isGatewayRunFastPathArgv(["node", "openclaw", "gateway", "--force"])).toBe(true);
-    expect(isGatewayRunFastPathArgv(["node", "openclaw", "gateway", "--port", "18789"])).toBe(true);
-    expect(isGatewayRunFastPathArgv(["node", "openclaw", "gateway", "--auth=none"])).toBe(true);
+  it("skips proxy startup before SQLite maintenance", () => {
+    expect(shouldStartProxyForCli(cliArgs("doctor", "--state-sqlite", "compact", "--json"))).toBe(
+      false,
+    );
+    expect(shouldStartProxyForCli(cliArgs("doctor", "--state-sqlite=compact", "--json"))).toBe(
+      false,
+    );
+    expect(shouldStartProxyForCli(cliArgs("doctor", "--lint"))).toBe(true);
+  });
+
+  it("uses root help only for root invocations and aliases", () => {
+    expect(shouldUseRootHelpFastPath(cliArgs("--help"))).toBe(true);
+    expect(shouldUseRootHelpFastPath(cliArgs("help", "--help"))).toBe(true);
+    expect(shouldUseRootHelpFastPath(cliArgs("tools", "--help"))).toBe(true);
+    expect(shouldUseRootHelpFastPath(cliArgs("status", "--help"))).toBe(false);
+    expect(shouldUseRootHelpFastPath(cliArgs("--help", "status"))).toBe(false);
+    expect(shouldUseRootHelpFastPath(cliArgs("help", "gateway"))).toBe(false);
+  });
+
+  it("keeps setup help behind unambiguous argument parsing", () => {
+    expect(shouldUseSetupOnboardConfigureHelpFastPath(cliArgs("setup", "--help"))).toBe(true);
+    expect(shouldUseSetupOnboardConfigureHelpFastPath(cliArgs("onboard", "status", "--help"))).toBe(
+      false,
+    );
     expect(
-      isGatewayRunFastPathArgv(["node", "openclaw", "--no-color", "gateway", "--bind", "loopback"]),
-    ).toBe(true);
-    expect(isGatewayRunFastPathArgv(["node", "openclaw", "gateway", "run"])).toBe(true);
-    expect(
-      isGatewayRunFastPathArgv(["node", "openclaw", "gateway", "run", "--raw-stream-path", "x"]),
-    ).toBe(true);
-    expect(isGatewayRunFastPathArgv(["node", "openclaw", "gateway", "call", "health"])).toBe(false);
-    expect(isGatewayRunFastPathArgv(["node", "openclaw", "gateway", "--help"])).toBe(false);
-    expect(isGatewayRunFastPathArgv(["node", "openclaw", "gateway", "--port"])).toBe(false);
-    expect(isGatewayRunFastPathArgv(["node", "openclaw", "gateway", "--unknown"])).toBe(false);
-  });
-});
-
-describe("rewriteUpdateFlagArgv", () => {
-  it("leaves argv unchanged when --update is absent", () => {
-    const argv = ["node", "entry.js", "status"];
-    expect(rewriteUpdateFlagArgv(argv)).toBe(argv);
-  });
-
-  it("rewrites --update into the update command", () => {
-    expect(rewriteUpdateFlagArgv(["node", "entry.js", "--update"])).toEqual([
-      "node",
-      "entry.js",
-      "update",
-    ]);
-  });
-
-  it("preserves global flags that appear before --update", () => {
-    expect(rewriteUpdateFlagArgv(["node", "entry.js", "--profile", "p", "--update"])).toEqual([
-      "node",
-      "entry.js",
-      "--profile",
-      "p",
-      "update",
-    ]);
-  });
-
-  it("keeps update options after the rewritten command", () => {
-    expect(rewriteUpdateFlagArgv(["node", "entry.js", "--update", "--json"])).toEqual([
-      "node",
-      "entry.js",
-      "update",
-      "--json",
-    ]);
-  });
-});
-
-describe("shouldEnsureCliPath", () => {
-  it("skips path bootstrap for help/version invocations", () => {
-    expect(shouldEnsureCliPath(["node", "openclaw", "--help"])).toBe(false);
-    expect(shouldEnsureCliPath(["node", "openclaw", "-V"])).toBe(false);
-    expect(shouldEnsureCliPath(["node", "openclaw", "-v"])).toBe(false);
-  });
-
-  it("skips path bootstrap for read-only fast paths", () => {
-    expect(shouldEnsureCliPath(["node", "openclaw"])).toBe(false);
-    expect(shouldEnsureCliPath(["node", "openclaw", "--profile", "work"])).toBe(false);
-    expect(shouldEnsureCliPath(["node", "openclaw", "status"])).toBe(false);
-    expect(shouldEnsureCliPath(["node", "openclaw", "--log-level", "debug", "status"])).toBe(false);
-    expect(shouldEnsureCliPath(["node", "openclaw", "sessions", "--json"])).toBe(false);
-    expect(shouldEnsureCliPath(["node", "openclaw", "config", "get", "update"])).toBe(false);
-    expect(shouldEnsureCliPath(["node", "openclaw", "models", "status", "--json"])).toBe(false);
-    expect(shouldEnsureCliPath(["node", "openclaw", "tools", "effective"])).toBe(false);
-  });
-
-  it("keeps path bootstrap for mutating or unknown commands", () => {
-    expect(shouldEnsureCliPath(["node", "openclaw", "message", "send"])).toBe(true);
-    expect(shouldEnsureCliPath(["node", "openclaw", "voicecall", "status"])).toBe(true);
-    expect(shouldEnsureCliPath(["node", "openclaw", "acp", "-v"])).toBe(true);
-  });
-});
-
-describe("shouldStartCrestodianForBareRoot", () => {
-  it("starts Crestodian for bare root invocations", () => {
-    expect(shouldStartCrestodianForBareRoot(["node", "openclaw"])).toBe(true);
-    expect(shouldStartCrestodianForBareRoot(["node", "openclaw", "--profile", "work"])).toBe(true);
-    expect(shouldStartCrestodianForBareRoot(["node", "openclaw", "--dev"])).toBe(true);
-  });
-
-  it("does not start Crestodian for help, version, or commands", () => {
-    expect(shouldStartCrestodianForBareRoot(["node", "openclaw", "--help"])).toBe(false);
-    expect(shouldStartCrestodianForBareRoot(["node", "openclaw", "-V"])).toBe(false);
-    expect(shouldStartCrestodianForBareRoot(["node", "openclaw", "status"])).toBe(false);
-  });
-});
-
-describe("shouldStartCrestodianForModernOnboard", () => {
-  it("starts Crestodian before heavy command registration for modern onboard", () => {
-    expect(
-      shouldStartCrestodianForModernOnboard([
-        "node",
-        "openclaw",
-        "onboard",
-        "--modern",
-        "--non-interactive",
-        "--json",
-      ]),
-    ).toBe(true);
-  });
-
-  it("keeps classic onboard and help on the normal command path", () => {
-    expect(shouldStartCrestodianForModernOnboard(["node", "openclaw", "onboard"])).toBe(false);
-    expect(
-      shouldStartCrestodianForModernOnboard(["node", "openclaw", "onboard", "--modern", "--help"]),
+      shouldUseSetupOnboardConfigureHelpFastPath(cliArgs("onboard", "--gateway-port", "--help")),
     ).toBe(false);
   });
 });
 
-describe("shouldStartProxyForCli", () => {
-  it("starts managed proxy routing for the --update shorthand", () => {
-    expect(shouldStartProxyForCli(["node", "openclaw", "--update"])).toBe(true);
-    expect(shouldStartProxyForCli(["node", "openclaw", "--profile", "p", "--update"])).toBe(true);
-  });
-});
+function commandResolvers(registry: PluginManifestCommandAliasRegistry) {
+  return {
+    resolveCommandAliasOwner: ({ command }: { command: string | undefined }) =>
+      resolveManifestCommandAliasOwnerInRegistry({ command, registry }),
+    resolveToolOwner: ({ toolName }: { toolName: string | undefined }) =>
+      resolveManifestToolOwnerInRegistry({ toolName, registry }),
+  };
+}
 
-describe("shouldUseRootHelpFastPath", () => {
-  it("uses the fast path for root help only", () => {
-    expect(shouldUseRootHelpFastPath(["node", "openclaw", "--help"])).toBe(true);
-    expect(shouldUseRootHelpFastPath(["node", "openclaw", "--profile", "work", "-h"])).toBe(true);
-    expect(shouldUseRootHelpFastPath(["node", "openclaw", "help", "--help"])).toBe(true);
-    expect(shouldUseRootHelpFastPath(["node", "openclaw", "tools", "--help"])).toBe(true);
-    expect(shouldUseRootHelpFastPath(["node", "openclaw", "status", "--help"])).toBe(false);
-    expect(shouldUseRootHelpFastPath(["node", "openclaw", "--help", "status"])).toBe(false);
-    expect(shouldUseRootHelpFastPath(["node", "openclaw", "help", "gateway"])).toBe(false);
-  });
-});
-
-describe("shouldUseBrowserHelpFastPath", () => {
-  it("uses the fast path for browser command help only", () => {
-    expect(shouldUseBrowserHelpFastPath(["node", "openclaw", "browser", "--help"])).toBe(true);
-    expect(shouldUseBrowserHelpFastPath(["node", "openclaw", "browser", "-h"])).toBe(true);
-    expect(
-      shouldUseBrowserHelpFastPath(["node", "openclaw", "--profile", "work", "browser", "-h"]),
-    ).toBe(true);
-    expect(shouldUseBrowserHelpFastPath(["node", "openclaw", "browser", "status", "--help"])).toBe(
-      false,
-    );
-    expect(shouldUseBrowserHelpFastPath(["node", "openclaw", "status", "--help"])).toBe(false);
-  });
-});
-
-describe("resolveMissingPluginCommandMessage", () => {
-  it("explains plugins.allow misses for a bundled plugin command", () => {
+describe("plugin command policy", () => {
+  it("reports a disabled root without an alias record", () => {
     expect(
       resolveMissingPluginCommandMessage("browser", {
-        plugins: {
-          allow: ["quietchat"],
-        },
-      }),
-    ).toContain('`plugins.allow` excludes "browser"');
-  });
-
-  it("explains explicit bundled plugin disablement", () => {
-    expect(
-      resolveMissingPluginCommandMessage("browser", {
-        plugins: {
-          entries: {
-            browser: {
-              enabled: false,
-            },
-          },
-        },
+        plugins: { entries: { browser: { enabled: false } } },
       }),
     ).toContain("plugins.entries.browser.enabled=false");
   });
 
-  it("returns null when the bundled plugin command is already allowed", () => {
+  it.each([
+    {
+      command: "voicecall",
+      plugin: { id: "voice-call", commandAliases: [{ name: "voicecall" }] },
+      config: { plugins: { entries: { "voice-call": { enabled: true } } } },
+    },
+    {
+      command: "wiki",
+      plugin: { id: "memory-wiki", enabledByDefault: true, commandAliases: [{ name: "wiki" }] },
+      config: { plugins: { allow: ["memory-wiki"] } },
+    },
+  ])("accepts enabled parent ownership for $command", ({ command, plugin, config }) => {
     expect(
-      resolveMissingPluginCommandMessage("browser", {
-        plugins: {
-          allow: ["browser"],
-        },
-      }),
+      resolveMissingPluginCommandMessage(command, config, commandResolvers({ plugins: [plugin] })),
     ).toBeNull();
   });
+});
 
-  it("explains that dreaming is a runtime slash command, not a CLI command", () => {
-    const message = resolveMissingPluginCommandMessage(
-      "dreaming",
-      {},
-      {
-        registry: memoryCoreCommandAliasRegistry,
-      },
-    );
-    expect(message).toContain("runtime slash command");
-    expect(message).toContain("/dreaming");
-    expect(message).toContain("memory-core");
-    expect(message).toContain("openclaw memory");
-  });
+it("keeps post-root log levels out of the gateway command path", () => {
+  expect(
+    resolveGatewayCatalogCommandPath(cliArgs("gateway", "--log-level", "debug", "run")),
+  ).toEqual(["gateway", "run"]);
+  expect(
+    resolveGatewayCatalogCommandPath(
+      cliArgs("gateway", "--log-level=debug", "restart-handoff", "capabilities"),
+    ),
+  ).toEqual(["gateway", "restart-handoff"]);
+});
 
-  it("returns the runtime command message even when plugins.allow is set", () => {
-    const message = resolveMissingPluginCommandMessage(
-      "dreaming",
-      {
-        plugins: {
-          allow: ["memory-core"],
-        },
-      },
-      {
-        registry: memoryCoreCommandAliasRegistry,
-      },
-    );
-    expect(message).toContain("runtime slash command");
-    expect(message).not.toContain("plugins.allow");
-  });
-
-  it("points command names in plugins.allow at their parent plugin", () => {
-    const message = resolveMissingPluginCommandMessage(
-      "dreaming",
-      {
-        plugins: {
-          allow: ["dreaming"],
-        },
-      },
-      {
-        registry: memoryCoreCommandAliasRegistry,
-      },
-    );
-    expect(message).toContain('"dreaming" is not a plugin');
-    expect(message).toContain('"memory-core"');
-    expect(message).toContain("plugins.allow");
-  });
-
-  it("explains parent plugin disablement for runtime command aliases", () => {
-    const message = resolveMissingPluginCommandMessage(
-      "dreaming",
-      {
-        plugins: {
-          entries: {
-            "memory-core": {
-              enabled: false,
-            },
-          },
-        },
-      },
-      {
-        registry: memoryCoreCommandAliasRegistry,
-      },
-    );
-    expect(message).toContain("plugins.entries.memory-core.enabled=false");
-    expect(message).not.toContain("runtime slash command");
-  });
-
-  it("allows CLI commands when their parent plugin is in plugins.allow", () => {
-    const message = resolveMissingPluginCommandMessage(
-      "wiki",
-      {
-        plugins: {
-          allow: ["memory-wiki"],
-        },
-      },
-      { registry: memoryWikiCommandAliasRegistry },
-    );
-    expect(message).toBeNull();
-  });
-
-  it("blocks CLI commands when parent plugin is NOT in plugins.allow", () => {
-    const message = resolveMissingPluginCommandMessage(
-      "wiki",
-      {
-        plugins: {
-          allow: ["quietchat"],
-        },
-      },
-      { registry: memoryWikiCommandAliasRegistry },
-    );
-    expect(message).not.toBeNull();
-    expect(message).toContain('"memory-wiki"');
-    expect(message).toContain("plugins.allow");
-  });
+it("keeps reserved non-plugin roots out of plugin allowlist diagnostics", () => {
+  expect(
+    resolveMissingPluginCommandMessage("auth", { plugins: { allow: ["browser"] } }),
+  ).toBeNull();
 });

@@ -3,18 +3,9 @@ import {
   normalizeChannelId as normalizeAnyChannelId,
 } from "../../channels/plugins/index.js";
 import { resolveSessionConversationRef } from "../../channels/plugins/session-conversation.js";
-import { normalizeChannelId as normalizeChatChannelId } from "../../channels/registry.js";
-import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import { normalizeChatChannelId } from "../../channels/registry.js";
+import { parseSessionDeliveryRoute } from "../../sessions/session-key-utils.js";
 import { ANNOUNCE_SKIP_TOKEN, REPLY_SKIP_TOKEN } from "./sessions-send-tokens.js";
-export {
-  ANNOUNCE_SKIP_TOKEN,
-  REPLY_SKIP_TOKEN,
-  isAnnounceSkip,
-  isReplySkip,
-} from "./sessions-send-tokens.js";
-
-const DEFAULT_PING_PONG_TURNS = 5;
-const MAX_PING_PONG_TURNS = 5;
 
 export type AnnounceTarget = {
   channel: string;
@@ -26,13 +17,38 @@ export type AnnounceTarget = {
 export function resolveAnnounceTargetFromKey(sessionKey: string): AnnounceTarget | null {
   const parsed = resolveSessionConversationRef(sessionKey);
   if (!parsed) {
-    return null;
+    const directRoute = parseSessionDeliveryRoute(sessionKey);
+    if (!directRoute || (directRoute.peerKind !== "direct" && directRoute.peerKind !== "dm")) {
+      return null;
+    }
+
+    const normalizedChannel =
+      normalizeAnyChannelId(directRoute.channel) ?? normalizeChatChannelId(directRoute.channel);
+    const channel = normalizedChannel ?? directRoute.channel;
+    const messaging = normalizedChannel
+      ? getChannelPlugin(normalizedChannel)?.messaging
+      : undefined;
+    // Session peers are canonical; adapters restore API casing at their boundary.
+    // Channel-style resolvers must not turn an explicit direct user into a room.
+    const resolvedTarget =
+      messaging?.directTargetStyle === "user-prefixed"
+        ? undefined
+        : messaging?.resolveDeliveryTarget?.({ conversationId: directRoute.peerId });
+    const directTarget = `user:${directRoute.peerId}`;
+
+    return {
+      channel,
+      to: resolvedTarget?.to?.trim() || messaging?.normalizeTarget?.(directTarget) || directTarget,
+      ...(directRoute.accountId ? { accountId: directRoute.accountId } : {}),
+      threadId: resolvedTarget?.threadId ?? directRoute.threadId,
+    };
   }
   const normalizedChannel =
     normalizeAnyChannelId(parsed.channel) ?? normalizeChatChannelId(parsed.channel);
   const channel = normalizedChannel ?? parsed.channel;
   const plugin = normalizedChannel ? getChannelPlugin(normalizedChannel) : null;
   const genericTarget = parsed.kind === "channel" ? `channel:${parsed.id}` : `group:${parsed.id}`;
+  // Prefer plugin-owned target normalization so channel-specific IDs and topics survive routing.
   const normalized =
     plugin?.messaging?.resolveSessionTarget?.({
       kind: parsed.kind,
@@ -49,17 +65,17 @@ export function resolveAnnounceTargetFromKey(sessionKey: string): AnnounceTarget
 function buildAgentSessionLines(params: {
   requesterSessionKey?: string;
   requesterChannel?: string;
-  targetSessionKey: string;
   targetChannel?: string;
 }): string[] {
   return [
-    params.requesterSessionKey
-      ? `Agent 1 (requester) session: ${params.requesterSessionKey}.`
-      : undefined,
+    // Session keys are high-cardinality (thread/run ids), so concrete values churn the
+    // system prompt and break provider prompt-cache reuse across A2A turns. Channels are
+    // low-cardinality and inform reply formatting, so they stay concrete.
+    params.requesterSessionKey ? "Agent 1 (requester) session: <REQUESTER_SESSION>." : undefined,
     params.requesterChannel
       ? `Agent 1 (requester) channel: ${params.requesterChannel}.`
       : undefined,
-    `Agent 2 (target) session: ${params.targetSessionKey}.`,
+    "Agent 2 (target) session: <TARGET_SESSION>.",
     params.targetChannel ? `Agent 2 (target) channel: ${params.targetChannel}.` : undefined,
   ].filter((line): line is string => Boolean(line));
 }
@@ -67,18 +83,13 @@ function buildAgentSessionLines(params: {
 export function buildAgentToAgentMessageContext(params: {
   requesterSessionKey?: string;
   requesterChannel?: string;
-  targetSessionKey: string;
 }) {
-  const lines = ["Agent-to-agent message context:", ...buildAgentSessionLines(params)].filter(
-    Boolean,
-  );
-  return lines.join("\n");
+  return ["Agent-to-agent message context:", ...buildAgentSessionLines(params)].join("\n");
 }
 
 export function buildAgentToAgentReplyContext(params: {
   requesterSessionKey?: string;
   requesterChannel?: string;
-  targetSessionKey: string;
   targetChannel?: string;
   currentRole: "requester" | "target";
   turn: number;
@@ -86,26 +97,24 @@ export function buildAgentToAgentReplyContext(params: {
 }) {
   const currentLabel =
     params.currentRole === "requester" ? "Agent 1 (requester)" : "Agent 2 (target)";
-  const lines = [
+  return [
     "Agent-to-agent reply step:",
     `Current agent: ${currentLabel}.`,
     `Turn ${params.turn} of ${params.maxTurns}.`,
     ...buildAgentSessionLines(params),
     `If you want to stop the ping-pong, reply exactly "${REPLY_SKIP_TOKEN}".`,
-  ].filter(Boolean);
-  return lines.join("\n");
+  ].join("\n");
 }
 
 export function buildAgentToAgentAnnounceContext(params: {
   requesterSessionKey?: string;
   requesterChannel?: string;
-  targetSessionKey: string;
   targetChannel?: string;
   originalMessage: string;
   roundOneReply?: string;
   latestReply?: string;
 }) {
-  const lines = [
+  return [
     "Agent-to-agent announce step:",
     ...buildAgentSessionLines(params),
     `Original request: ${params.originalMessage}`,
@@ -114,18 +123,7 @@ export function buildAgentToAgentAnnounceContext(params: {
       : "Round 1 reply: (not available).",
     params.latestReply ? `Latest reply: ${params.latestReply}` : "Latest reply: (not available).",
     `If you want to remain silent, reply exactly "${ANNOUNCE_SKIP_TOKEN}".`,
-    "Any other reply will be posted to the target channel.",
+    "Any other reply is recorded in the target session. External delivery is attempted only if the target has a delivery route.",
     "After this reply, the agent-to-agent conversation is over.",
-  ].filter(Boolean);
-  return lines.join("\n");
-}
-
-export function resolvePingPongTurns(cfg?: OpenClawConfig) {
-  const raw = cfg?.session?.agentToAgent?.maxPingPongTurns;
-  const fallback = DEFAULT_PING_PONG_TURNS;
-  if (typeof raw !== "number" || !Number.isFinite(raw)) {
-    return fallback;
-  }
-  const rounded = Math.floor(raw);
-  return Math.max(0, Math.min(MAX_PING_PONG_TURNS, rounded));
+  ].join("\n");
 }

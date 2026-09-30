@@ -1,12 +1,6 @@
-import type { ChannelSetupWizard, ChannelSetupWizardAdapter } from "./setup-wizard-types.js";
-import type { ChannelConfigSchema } from "./types.config.js";
-export type {
-  ChannelConfigRuntimeIssue,
-  ChannelConfigRuntimeParseResult,
-  ChannelConfigRuntimeSchema,
-  ChannelConfigSchema,
-  ChannelConfigUiHint,
-} from "./types.config.js";
+import type { OperatorScope } from "../../gateway/operator-scopes.js";
+import type { ChannelMessageAdapterShape } from "../message/types.js";
+import type { ChannelSetupPlugin } from "./setup-wizard-types.js";
 import type {
   ChannelApprovalCapability,
   ChannelAuthAdapter,
@@ -25,45 +19,55 @@ import type {
   ChannelPairingAdapter,
   ChannelSecretsAdapter,
   ChannelSecurityAdapter,
-  ChannelSetupAdapter,
   ChannelStatusAdapter,
   ChannelAllowlistAdapter,
   ChannelConfiguredBindingProvider,
 } from "./types.adapters.js";
+import type { ChannelConfigSchema } from "./types.config.js";
 import type {
   ChannelAgentTool,
   ChannelAgentToolFactory,
-  ChannelCapabilities,
-  ChannelId,
   ChannelAgentPromptAdapter,
   ChannelMentionAdapter,
   ChannelMessageActionAdapter,
   ChannelMessagingAdapter,
-  ChannelMeta,
   ChannelStreamingAdapter,
   ChannelThreadingAdapter,
 } from "./types.core.js";
 
-/** Full capability contract for a native channel plugin. */
-type ChannelPluginSetupWizard = ChannelSetupWizard | ChannelSetupWizardAdapter;
+type ChannelGatewayMethodDescriptor = {
+  name: string;
+  scope?: OperatorScope;
+  description?: string;
+};
 
-// Omitted generic means "plugin with some account shape", not "plugin whose
-// account is literally Record<string, unknown>".
+/** Full capability contract for a native channel plugin. */
+// Omitted generic means "plugin with some account shape"; using unknown makes
+// callback parameters contravariant and rejects concrete plugin implementations.
 // oxlint-disable-next-line typescript/no-explicit-any
-export type ChannelPlugin<ResolvedAccount = any, Probe = unknown, Audit = unknown> = {
-  id: ChannelId;
-  meta: ChannelMeta;
-  capabilities: ChannelCapabilities;
+export type ChannelPlugin<ResolvedAccount = any, Probe = unknown, Audit = unknown> = Omit<
+  ChannelSetupPlugin,
+  "config"
+> & {
   defaults?: {
     queue?: {
       debounceMs?: number;
     };
   };
-  reload?: { configPrefixes: string[]; noopPrefixes?: string[] };
-  setupWizard?: ChannelPluginSetupWizard;
+  reload?: {
+    configPrefixes: string[];
+    /** Published dynamic reads; `*` matches one nonempty dotted config key. */
+    noopPrefixes?: string[];
+    /**
+     * Opt into restarting only the changed non-default named account.
+     * Set only when sibling account resolution and lifecycle state are isolated and
+     * account stop fully settles owned work. Shared, default, removed, or unresolved
+     * account changes still restart the whole channel.
+     */
+    accountScopedRestart?: boolean;
+  };
   config: ChannelConfigAdapter<ResolvedAccount>;
   configSchema?: ChannelConfigSchema;
-  setup?: ChannelSetupAdapter;
   pairing?: ChannelPairingAdapter;
   security?: ChannelSecurityAdapter<ResolvedAccount>;
   groups?: ChannelGroupAdapter;
@@ -71,6 +75,7 @@ export type ChannelPlugin<ResolvedAccount = any, Probe = unknown, Audit = unknow
   outbound?: ChannelOutboundAdapter;
   status?: ChannelStatusAdapter<ResolvedAccount, Probe, Audit>;
   gatewayMethods?: string[];
+  gatewayMethodDescriptors?: ChannelGatewayMethodDescriptor[];
   gateway?: ChannelGatewayAdapter<ResolvedAccount>;
   // Login/logout and channel-auth only. Approval auth lives on approvalCapability.
   auth?: ChannelAuthAdapter;
@@ -85,6 +90,7 @@ export type ChannelPlugin<ResolvedAccount = any, Probe = unknown, Audit = unknow
   conversationBindings?: ChannelConversationBindingSupport;
   streaming?: ChannelStreamingAdapter;
   threading?: ChannelThreadingAdapter;
+  message?: ChannelMessageAdapterShape;
   messaging?: ChannelMessagingAdapter;
   agentPrompt?: ChannelAgentPromptAdapter;
   directory?: ChannelDirectoryAdapter;

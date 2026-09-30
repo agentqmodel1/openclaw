@@ -2,8 +2,8 @@ import type {
   ChannelThreadingContext,
   ChannelThreadingToolContext,
 } from "openclaw/plugin-sdk/channel-contract";
-import type { OpenClawConfig } from "openclaw/plugin-sdk/config-types";
-import { normalizeOptionalString } from "openclaw/plugin-sdk/text-runtime";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
+import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { parseTelegramTarget } from "./targets.js";
 
 function resolveTelegramToolContextThreadId(context: ChannelThreadingContext): string | undefined {
@@ -24,9 +24,6 @@ export function buildTelegramThreadingToolContext(params: {
   context: ChannelThreadingContext;
   hasRepliedRef?: { value: boolean };
 }): ChannelThreadingToolContext {
-  void params.cfg;
-  void params.accountId;
-
   return {
     currentChannelId: normalizeOptionalString(params.context.To),
     currentThreadTs: resolveTelegramToolContextThreadId(params.context),

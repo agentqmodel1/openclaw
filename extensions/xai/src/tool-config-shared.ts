@@ -1,7 +1,5 @@
-import { isRecord } from "openclaw/plugin-sdk/text-runtime";
+import { isRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { normalizeXaiModelId } from "../model-id.js";
-
-export { isRecord };
 
 export function coerceXaiToolConfig(
   config: Record<string, unknown> | undefined,

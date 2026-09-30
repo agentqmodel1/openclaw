@@ -1,7 +1,7 @@
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import type { ReplyToMode } from "../../config/types.js";
-import { normalizeOptionalString } from "../../shared/string-coerce.js";
 
-export type ReplyReferencePlanner = {
+type ReplyReferencePlanner = {
   /** Returns the effective reply/thread id for the next send without updating state. */
   peek(): string | undefined;
   /** Returns the effective reply/thread id for the next send and updates state. */
@@ -33,42 +33,28 @@ export function createReplyReferencePlanner(options: {
   const startId = normalizeOptionalString(options.startId);
 
   const resolve = (): string | undefined => {
-    if (!allowReference) {
+    if (
+      !allowReference ||
+      options.replyToMode === "off" ||
+      (isSingleUseReplyToMode(options.replyToMode) && hasReplied)
+    ) {
       return undefined;
     }
-    if (options.replyToMode === "off") {
-      return undefined;
-    }
-    const id = existingId ?? startId;
-    if (!id) {
-      return undefined;
-    }
-    if (options.replyToMode === "all") {
-      return id;
-    }
-    if (isSingleUseReplyToMode(options.replyToMode) && hasReplied) {
-      return undefined;
-    }
-    return id;
-  };
-
-  const use = (): string | undefined => {
-    const id = resolve();
-    if (!id) {
-      return undefined;
-    }
-    hasReplied = true;
-    return id;
-  };
-
-  const markSent = () => {
-    hasReplied = true;
+    return existingId ?? startId;
   };
 
   return {
     peek: resolve,
-    use,
-    markSent,
+    use() {
+      const id = resolve();
+      if (id) {
+        hasReplied = true;
+      }
+      return id;
+    },
+    markSent() {
+      hasReplied = true;
+    },
     hasReplied: () => hasReplied,
   };
 }
